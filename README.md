@@ -56,6 +56,27 @@ git clone https://github.com/antgroup/ditto-talkinghead
 cd ditto-talkinghead
 ```
 
+### UV (Recommended) ⚡
+
+**One-command installation:**
+
+```bash
+uv sync
+```
+
+That's it! UV automatically:
+- Creates virtual environment with Python 3.10
+- Installs PyTorch 2.5.1 with CUDA 12.1
+- Installs TensorRT 10.13.3.9 for CUDA 12.x
+- Installs all dependencies
+
+Verify installation:
+```bash
+uv run python verify_installation.py
+```
+
+See **[INSTALL.md](INSTALL.md)** for complete guide.
+
 ### Conda
 Create `conda` environment:
 ```bash

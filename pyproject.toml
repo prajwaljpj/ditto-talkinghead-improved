@@ -1,0 +1,95 @@
+[project]
+name = "ditto-talkinghead"
+version = "0.1.0"
+description = "Ditto: Motion-Space Diffusion for Controllable Realtime Talking Head Synthesis"
+readme = "README.md"
+requires-python = ">=3.10,<3.11"
+dependencies = [
+    # Core dependencies
+    "torch==2.5.1",
+    "torchvision==0.20.1",
+    "torchaudio==2.5.1",
+    "numpy==2.0.1",
+
+    # Audio processing
+    "librosa==0.10.2.post1",
+    "soundfile==0.13.0",
+    "audioread==3.0.1",
+
+    # Image/Video processing
+    "opencv-python-headless==4.10.0.84",
+    "imageio==2.36.1",
+    "imageio-ffmpeg==0.5.1",
+    "pillow>=11.0.0",
+    "scikit-image==0.25.0",
+    "tifffile>=2024.12.12",
+
+    # Scientific computing
+    "scipy==1.15.0",
+    "scikit-learn==1.6.0",
+    "numba==0.60.0",
+
+    # Utilities
+    "tqdm>=4.67.1",
+    "filetype==1.2.0",
+    "pyyaml>=6.0.2",
+    "colored",
+
+    # Build tools
+    "cython>=3.0.11",
+    "cffi>=1.17.1",
+
+    # CUDA support (compatible with PyTorch 2.5.1+cu121)
+    # Note: PyTorch already includes most CUDA dependencies
+    # cuda-python 12.x required for TensorRT utilities (13.x has breaking API changes)
+    "cuda-python>=12.0,<13.0",
+
+    # TensorRT for CUDA 12.x (included by default for performance)
+    "tensorrt-cu12==10.13.3.9",
+    "polygraphy",
+]
+
+[project.optional-dependencies]
+# No optional dependencies - TensorRT is now included by default
+dev = [
+    # Development tools (optional)
+    "pytest>=7.0.0",
+    "black>=23.0.0",
+]
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["core"]
+
+[tool.setuptools.package-data]
+core = ["**/*"]
+
+[tool.uv]
+# Use PyTorch index for CUDA packages as primary
+index-url = "https://download.pytorch.org/whl/cu121"
+# Add NVIDIA index for TensorRT and other packages
+extra-index-url = [
+    "https://pypi.org/simple",
+    "https://pypi.nvidia.com"
+]
+
+[tool.uv.sources]
+# Ensure PyTorch comes from PyTorch index
+torch = { index = "pytorch" }
+torchvision = { index = "pytorch" }
+torchaudio = { index = "pytorch" }
+# Ensure TensorRT comes from NVIDIA index
+tensorrt-cu12 = { index = "nvidia" }
+
+[[tool.uv.index]]
+name = "pytorch"
+url = "https://download.pytorch.org/whl/cu121"
+explicit = true
+
+[[tool.uv.index]]
+name = "nvidia"
+url = "https://pypi.nvidia.com"
+explicit = true
