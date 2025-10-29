@@ -1,0 +1,3 @@
+[submodule "grid-sample3d-trt-plugin"]
+	path = grid-sample3d-trt-plugin
+	url = git@github.com:prajwaljpj/grid-sample3d-trt-plugin.git

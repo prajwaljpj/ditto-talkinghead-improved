@@ -9,6 +9,7 @@ __pycache__/
 # Model weights
 checkpoints
 **/*.pth
+**/*.pkl
 **/*.onnx
 **/*.pt
 **/*.pth.tar
@@ -36,3 +37,4 @@ log/*
 
 !example/audio.wav
 !example/image.png
+/TensorRT-10.13.3.9/
