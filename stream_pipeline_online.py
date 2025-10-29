@@ -1,7 +1,7 @@
 import threading
 import queue
 import numpy as np
-import traceback
+import time
 from tqdm import tqdm
 
 from core.atomic_components.avatar_registrar import AvatarRegistrar, smooth_x_s_info_lst
@@ -14,6 +14,10 @@ from core.atomic_components.putback import PutBack
 from core.atomic_components.writer import VideoWriterByImageIO
 from core.atomic_components.wav2feat import Wav2Feat
 from core.atomic_components.cfg import parse_cfg, print_cfg
+from core.utils.logging_config import get_logger, log_separator, log_queue_status, log_performance
+
+# Module logger
+logger = get_logger(__name__)
 
 
 """
@@ -40,6 +44,8 @@ wav2feat_cfg:
 
 class StreamSDK:
     def __init__(self, cfg_pkl, data_root, **kwargs):
+        logger.info("Initializing StreamSDK", extra={'metadata': {'cfg_pkl': cfg_pkl, 'data_root': data_root}})
+        start_time = time.time()
 
         [
             avatar_registrar_cfg,
@@ -51,9 +57,10 @@ class StreamSDK:
             wav2feat_cfg,
             default_kwargs,
         ] = parse_cfg(cfg_pkl, data_root, kwargs)
-        
+
         self.default_kwargs = default_kwargs
-        
+
+        logger.debug("Loading models and components")
         self.avatar_registrar = AvatarRegistrar(**avatar_registrar_cfg)
         self.condition_handler = ConditionHandler(**condition_handler_cfg)
         self.audio2motion = Audio2Motion(lmdm_cfg)
@@ -63,6 +70,9 @@ class StreamSDK:
         self.putback = PutBack()
 
         self.wav2feat = Wav2Feat(**wav2feat_cfg)
+
+        init_time_ms = (time.time() - start_time) * 1000
+        log_performance(logger, "StreamSDK initialization", init_time_ms)
 
     def _merge_kwargs(self, default_kwargs, run_kwargs):
         for k, v in default_kwargs.items():
@@ -97,9 +107,9 @@ class StreamSDK:
 
         # ======== Prepare Options ========
         kwargs = self._merge_kwargs(self.default_kwargs, kwargs)
-        print("=" * 20, "setup kwargs", "=" * 20)
-        print_cfg(**kwargs)
-        print("=" * 50)
+        log_separator(logger, "setup kwargs")
+        print_cfg(**kwargs)  # Keep print_cfg as it's a config display function
+        log_separator(logger, "")
 
         # -- avatar_registrar: template cfg --
         self.max_size = kwargs.get("max_size", 1920)
@@ -159,7 +169,10 @@ class StreamSDK:
         # only hubert support online mode
         assert self.wav2feat.support_streaming or not self.online_mode
 
+        logger.info(f"Setting up pipeline: source={source_path}, output={output_path}, online_mode={self.online_mode}")
+
         # ======== Register Avatar ========
+        logger.debug("Registering avatar")
         crop_kwargs = {
             "crop_scale": self.crop_scale,
             "crop_vx_ratio": self.crop_vx_ratio,
@@ -168,9 +181,9 @@ class StreamSDK:
         }
         n_frames = self.template_n_frames if self.template_n_frames > 0 else self.N_d
         source_info = self.avatar_registrar(
-            source_path, 
-            max_dim=self.max_size, 
-            n_frames=n_frames, 
+            source_path,
+            max_dim=self.max_size,
+            n_frames=n_frames,
             **crop_kwargs,
         )
 
@@ -179,14 +192,17 @@ class StreamSDK:
 
         self.source_info = source_info
         self.source_info_frames = len(source_info["x_s_info_lst"])
+        logger.info(f"Avatar registered: {self.source_info_frames} frames, is_image={source_info['is_image_flag']}")
 
         # ======== Setup Condition Handler ========
+        logger.debug("Setting up condition handler")
         self.condition_handler.setup(source_info, self.emo, eye_f0_mode=self.eye_f0_mode, ch_info=self.ch_info)
 
         # ======== Setup Audio2Motion (LMDM) ========
+        logger.debug("Setting up Audio2Motion (LMDM)")
         x_s_info_0 = self.condition_handler.x_s_info_0
         self.audio2motion.setup(
-            x_s_info_0, 
+            x_s_info_0,
             overlap_v2=self.overlap_v2,
             fix_kp_cond=self.fix_kp_cond,
             fix_kp_cond_dim=self.fix_kp_cond_dim,
@@ -197,6 +213,7 @@ class StreamSDK:
         )
 
         # ======== Setup Motion Stitch ========
+        logger.debug("Setting up motion stitch")
         is_image_flag = source_info["is_image_flag"]
         x_s_info = source_info['x_s_info_lst'][0]
         self.motion_stitch.setup(
@@ -217,9 +234,12 @@ class StreamSDK:
         )
 
         # ======== Video Writer ========
+        logger.debug(f"Setting up video writer: {output_path}")
         self.output_path = output_path
         self.tmp_output_path = output_path + ".tmp.mp4"
-        self.writer = VideoWriterByImageIO(self.tmp_output_path)
+        self.fps = kwargs.get("fps", 25)
+        logger.info(f"Video writer FPS: {self.fps}")
+        self.writer = VideoWriterByImageIO(self.tmp_output_path, fps=self.fps)
         self.writer_pbar = tqdm(desc="writer")
 
         # ======== Audio Feat Buffer ========
@@ -246,16 +266,18 @@ class StreamSDK:
         self.writer_queue = queue.Queue(maxsize=QUEUE_MAX_SIZE)
 
         self.thread_list = [
-            threading.Thread(target=self.audio2motion_worker),
-            threading.Thread(target=self.motion_stitch_worker),
-            threading.Thread(target=self.warp_f3d_worker),
-            threading.Thread(target=self.decode_f3d_worker),
-            threading.Thread(target=self.putback_worker),
-            threading.Thread(target=self.writer_worker),
+            threading.Thread(target=self.audio2motion_worker, name="Audio2Motion"),
+            threading.Thread(target=self.motion_stitch_worker, name="MotionStitch"),
+            threading.Thread(target=self.warp_f3d_worker, name="WarpF3D"),
+            threading.Thread(target=self.decode_f3d_worker, name="DecodeF3D"),
+            threading.Thread(target=self.putback_worker, name="PutBack"),
+            threading.Thread(target=self.writer_worker, name="Writer"),
         ]
 
+        logger.info(f"Starting {len(self.thread_list)} worker threads")
         for thread in self.thread_list:
             thread.start()
+        logger.info("All worker threads started successfully")
 
     def _get_ctrl_info(self, fid):
         try:
@@ -266,13 +288,16 @@ class StreamSDK:
             else:
                 return {}
         except Exception as e:
-            traceback.print_exc()
+            logger.exception(f"Error getting ctrl_info for frame {fid}", extra={'metadata': {'fid': fid}})
             return {}
 
     def writer_worker(self):
+        logger.debug("Writer worker thread started")
         try:
             self._writer_worker()
+            logger.debug("Writer worker thread finished successfully")
         except Exception as e:
+            logger.exception("Error in writer_worker")
             self.worker_exception = e
             self.stop_event.set()
 
@@ -290,9 +315,12 @@ class StreamSDK:
             self.writer_pbar.update()
 
     def putback_worker(self):
+        logger.debug("PutBack worker thread started")
         try:
             self._putback_worker()
+            logger.debug("PutBack worker thread finished successfully")
         except Exception as e:
+            logger.exception("Error in putback_worker")
             self.worker_exception = e
             self.stop_event.set()
 
@@ -312,9 +340,12 @@ class StreamSDK:
             self.writer_queue.put(res_frame_rgb)
 
     def decode_f3d_worker(self):
+        logger.debug("DecodeF3D worker thread started")
         try:
             self._decode_f3d_worker()
+            logger.debug("DecodeF3D worker thread finished successfully")
         except Exception as e:
+            logger.exception("Error in decode_f3d_worker")
             self.worker_exception = e
             self.stop_event.set()
 
@@ -332,9 +363,12 @@ class StreamSDK:
             self.putback_queue.put([frame_idx, render_img])
 
     def warp_f3d_worker(self):
+        logger.debug("WarpF3D worker thread started")
         try:
             self._warp_f3d_worker()
+            logger.debug("WarpF3D worker thread finished successfully")
         except Exception as e:
+            logger.exception("Error in warp_f3d_worker")
             self.worker_exception = e
             self.stop_event.set()
 
@@ -353,9 +387,12 @@ class StreamSDK:
             self.decode_f3d_queue.put([frame_idx, f_3d])
 
     def motion_stitch_worker(self):
+        logger.debug("MotionStitch worker thread started")
         try:
             self._motion_stitch_worker()
+            logger.debug("MotionStitch worker thread finished successfully")
         except Exception as e:
+            logger.exception("Error in motion_stitch_worker")
             self.worker_exception = e
             self.stop_event.set()
 
@@ -375,9 +412,12 @@ class StreamSDK:
             self.warp_f3d_queue.put([frame_idx, x_s, x_d])
 
     def audio2motion_worker(self):
+        logger.debug("Audio2Motion worker thread started")
         try:
             self._audio2motion_worker()
+            logger.debug("Audio2Motion worker thread finished successfully")
         except Exception as e:
+            logger.exception("Error in audio2motion_worker")
             self.worker_exception = e
             self.stop_event.set()
         
@@ -455,6 +495,10 @@ class StreamSDK:
 
                         gen_frame_idx += 1
 
+                        # Log progress periodically
+                        if gen_frame_idx %  50 == 0:
+                            logger.info(f"Generated {gen_frame_idx} frames so far")
+
                     res_kp_seq_valid_start += real_valid_len
                 
                     local_idx += real_valid_len
@@ -476,25 +520,32 @@ class StreamSDK:
                 local_idx -= cut_L
 
             if is_end:
+                logger.info(f"Audio2Motion worker ending: generated {gen_frame_idx} total frames")
                 break
-        
+
+        logger.info(f"Audio2Motion worker finishing: putting None signal, generated {gen_frame_idx} frames")
         self.motion_stitch_queue.put(None)
 
     def close(self):
+        logger.info("Closing StreamSDK pipeline")
         # flush frames
         self.audio2motion_queue.put(None)
         # Wait for worker threads to finish
+        logger.debug("Waiting for worker threads to finish")
         for thread in self.thread_list:
             thread.join()
+        logger.debug("All worker threads finished")
 
         try:
             self.writer.close()
             self.writer_pbar.close()
-        except:
-            traceback.print_exc()
+            logger.info(f"Video written successfully to {self.output_path}")
+        except Exception as e:
+            logger.exception("Error closing writer")
 
         # Check if any worker encountered an exception
         if self.worker_exception is not None:
+            logger.error("Worker exception detected, re-raising")
             raise self.worker_exception
         
     def run_chunk(self, audio_chunk, chunksize=(3, 5, 2)):

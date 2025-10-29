@@ -10,6 +10,7 @@ dependencies = [
     "torchvision==0.20.1",
     "torchaudio==2.5.1",
     "numpy==2.0.1",
+    "einops>=0.8.0",
 
     # Audio processing
     "librosa==0.10.2.post1",
@@ -35,6 +36,21 @@ dependencies = [
     "pyyaml>=6.0.2",
     "colored",
 
+    # Logging
+    "rich>=13.9.4",
+    "python-json-logger>=3.2.1",
+
+    # API Framework
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.32.0",
+    "python-multipart>=0.0.17",
+    "websockets>=14.0",
+    "pydantic>=2.0.0",
+    "pydantic-settings>=2.0.0",
+
+    # GPU utilities
+    "pynvml>=11.5.3",
+
     # Build tools
     "cython>=3.0.11",
     "cffi>=1.17.1",
@@ -47,6 +63,12 @@ dependencies = [
     # TensorRT for CUDA 12.x (included by default for performance)
     "tensorrt-cu12==10.13.3.9",
     "polygraphy",
+
+    # ONNX Runtime for model inference
+    "onnxruntime-gpu>=1.16.0",
+
+    # Face landmark detection
+    "mediapipe>=0.10.0",
 ]
 
 [project.optional-dependencies]
