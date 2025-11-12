@@ -93,13 +93,17 @@ class StreamSDK:
                 ctrl_info[i] = item
         self.ctrl_info = ctrl_info
 
-    def setup(self, source_path, output_path, **kwargs):
+    def setup(self, source_path, output_path, frame_callback=None, **kwargs):
 
         # ======== Prepare Options ========
         kwargs = self._merge_kwargs(self.default_kwargs, kwargs)
         print("=" * 20, "setup kwargs", "=" * 20)
         print_cfg(**kwargs)
         print("=" * 50)
+
+        # Store frame callback for streaming mode
+        self.frame_callback = frame_callback
+        self.streaming_mode = frame_callback is not None
 
         # -- avatar_registrar: template cfg --
         self.max_size = kwargs.get("max_size", 1920)
@@ -218,9 +222,17 @@ class StreamSDK:
 
         # ======== Video Writer ========
         self.output_path = output_path
-        self.tmp_output_path = output_path + ".tmp.mp4"
-        self.writer = VideoWriterByImageIO(self.tmp_output_path)
-        self.writer_pbar = tqdm(desc="writer")
+        if not self.streaming_mode:
+            self.tmp_output_path = output_path + ".tmp.mp4"
+            self.writer = VideoWriterByImageIO(self.tmp_output_path)
+            self.writer_pbar = tqdm(desc="writer")
+        else:
+            self.writer = None
+            self.writer_pbar = None
+
+        # Track frame timestamps for streaming
+        self.frame_idx_counter = 0
+        self.fps = kwargs.get("fps", 25)
 
         # ======== Audio Feat Buffer ========
         if self.online_mode:
@@ -286,8 +298,18 @@ class StreamSDK:
             if item is None:
                 break
             res_frame_rgb = item
-            self.writer(res_frame_rgb, fmt="rgb")
-            self.writer_pbar.update()
+
+            if self.streaming_mode:
+                # Streaming mode: call frame callback
+                timestamp = self.frame_idx_counter / self.fps
+                if self.frame_callback:
+                    self.frame_callback(res_frame_rgb, self.frame_idx_counter, timestamp)
+                self.frame_idx_counter += 1
+            else:
+                # File writing mode
+                self.writer(res_frame_rgb, fmt="rgb")
+                self.writer_pbar.update()
+                self.frame_idx_counter += 1
 
     def putback_worker(self):
         try:
@@ -487,11 +509,12 @@ class StreamSDK:
         for thread in self.thread_list:
             thread.join()
 
-        try:
-            self.writer.close()
-            self.writer_pbar.close()
-        except:
-            traceback.print_exc()
+        if not self.streaming_mode:
+            try:
+                self.writer.close()
+                self.writer_pbar.close()
+            except:
+                traceback.print_exc()
 
         # Check if any worker encountered an exception
         if self.worker_exception is not None:

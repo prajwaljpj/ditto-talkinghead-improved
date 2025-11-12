@@ -1,0 +1,271 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Ditto Avatar - LiveKit</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 20px;
+            background: #f5f5f5;
+        }
+        .container {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 20px;
+        }
+        .panel {
+            background: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        video {
+            width: 100%;
+            background: #000;
+            border-radius: 4px;
+        }
+        audio {
+            width: 100%;
+            margin-top: 10px;
+        }
+        button {
+            width: 100%;
+            padding: 12px;
+            margin: 10px 0;
+            font-size: 16px;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+        }
+        button.primary {
+            background: #4CAF50;
+            color: white;
+        }
+        button.danger {
+            background: #f44336;
+            color: white;
+        }
+        button:disabled {
+            background: #ccc;
+            cursor: not-allowed;
+        }
+        .status {
+            padding: 10px;
+            border-radius: 4px;
+            margin: 10px 0;
+        }
+        .status.info { background: #e3f2fd; color: #1976d2; }
+        .status.success { background: #e8f5e9; color: #388e3c; }
+        .status.error { background: #ffebee; color: #c62828; }
+        input {
+            width: 100%;
+            padding: 10px;
+            margin: 5px 0;
+            box-sizing: border-box;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+        }
+        .hidden { display: none; }
+    </style>
+</head>
+<body>
+    <h1>🎭 Ditto Avatar - LiveKit</h1>
+
+    <div class="container">
+        <div class="panel">
+            <h2>Avatar Video</h2>
+            <video id="remoteVideo" autoplay playsinline></video>
+            <audio id="remoteAudio" autoplay></audio>
+            <div id="stats" class="hidden">
+                <small>Connection: <span id="state">disconnected</span></small>
+            </div>
+        </div>
+
+        <div class="panel">
+            <h2>Connection</h2>
+            <input type="text" id="url" value="ws://localhost:7880" placeholder="LiveKit URL">
+            <input type="text" id="room" value="ditto-avatar" placeholder="Room name">
+            <input type="text" id="name" value="User" placeholder="Your name">
+
+            <button id="connectBtn" class="primary" onclick="connect()">Connect</button>
+            <button id="disconnectBtn" class="danger hidden" onclick="disconnect()">Disconnect</button>
+
+            <div id="status" class="hidden"></div>
+
+            <hr>
+            <h3>Setup</h3>
+            <pre style="font-size: 11px; background: #f0f0f0; padding: 10px; border-radius: 4px;">
+# Terminal 1: Start LiveKit
+docker run --rm -p 7880:7880 -p 7881:7881 \\
+  -p 7882:7882/udp \\
+  -e LIVEKIT_KEYS="devkey: devsecret" \\
+  livekit/livekit-server:latest
+
+# Terminal 2: Start Agent
+./start_livekit_agent.sh
+            </pre>
+        </div>
+    </div>
+
+    <!-- Use ES Module version -->
+    <script type="module">
+        import {
+            Room,
+            RoomEvent,
+            Track,
+            createLocalAudioTrack
+        } from 'https://cdn.jsdelivr.net/npm/livekit-client@2.5.8/+esm';
+
+        console.log('✓ LiveKit ES Module loaded');
+
+        let room = null;
+        let localAudioTrack = null;
+
+        window.connect = async function() {
+            const url = document.getElementById('url').value;
+            const roomName = document.getElementById('room').value;
+            const participantName = document.getElementById('name').value;
+
+            if (!url || !roomName || !participantName) {
+                showStatus('Please fill all fields', 'error');
+                return;
+            }
+
+            try {
+                showStatus('Connecting...', 'info');
+                document.getElementById('connectBtn').disabled = true;
+
+                // Create room
+                room = new Room({
+                    adaptiveStream: true,
+                    dynacast: true,
+                });
+
+                // Handle tracks
+                room.on(RoomEvent.TrackSubscribed, (track, publication, participant) => {
+                    console.log('Track:', track.kind, 'from', participant.identity, 'isLocal:', participant.isLocal);
+
+                    // Only handle remote tracks (from agent/avatar)
+                    if (participant.isLocal) {
+                        return;
+                    }
+
+                    if (track.kind === Track.Kind.Video) {
+                        const video = document.getElementById('remoteVideo');
+                        track.attach(video);
+                        showStatus('Avatar connected!', 'success');
+                        document.getElementById('stats').classList.remove('hidden');
+                        console.log('✓ Avatar video track attached');
+                    } else if (track.kind === Track.Kind.Audio) {
+                        // Handle avatar audio (avatar speaking)
+                        const audio = document.getElementById('remoteAudio');
+                        track.attach(audio);
+                        console.log('✓ Avatar audio track attached - you should hear the avatar speak!');
+                    }
+                });
+
+                // Connection state
+                room.on(RoomEvent.ConnectionStateChanged, (state) => {
+                    document.getElementById('state').textContent = state;
+                });
+
+                // Generate token (call server endpoint)
+                const token = await generateToken(url, roomName, participantName);
+
+                // Connect
+                await room.connect(url, token);
+                console.log('✓ Connected to room');
+
+                // Publish audio
+                localAudioTrack = await createLocalAudioTrack({
+                    echoCancellation: true,
+                    noiseSuppression: true,
+                });
+                await room.localParticipant.publishTrack(localAudioTrack);
+                console.log('✓ Published audio');
+
+                showStatus('✅ Connected! Speak to animate avatar', 'success');
+                document.getElementById('connectBtn').classList.add('hidden');
+                document.getElementById('disconnectBtn').classList.remove('hidden');
+
+            } catch (error) {
+                console.error('Error:', error);
+                showStatus('Error: ' + error.message, 'error');
+                document.getElementById('connectBtn').disabled = false;
+            }
+        };
+
+        window.disconnect = function() {
+            if (localAudioTrack) {
+                localAudioTrack.stop();
+                localAudioTrack = null;
+            }
+            if (room) {
+                room.disconnect();
+                room = null;
+            }
+            document.getElementById('remoteVideo').srcObject = null;
+            const audio = document.getElementById('remoteAudio');
+            if (audio.srcObject) {
+                audio.srcObject = null;
+            }
+            document.getElementById('stats').classList.add('hidden');
+            document.getElementById('connectBtn').classList.remove('hidden');
+            document.getElementById('disconnectBtn').classList.add('hidden');
+            showStatus('Disconnected', 'info');
+        };
+
+        async function generateToken(livekitUrl, roomName, participantName) {
+            // Get token from local server endpoint
+            try {
+                const response = await fetch('http://localhost:8000/token', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        room: roomName,
+                        identity: participantName
+                    })
+                });
+
+                if (!response.ok) {
+                    throw new Error('Failed to get token');
+                }
+
+                const data = await response.json();
+                return data.token;
+            } catch (error) {
+                console.error('Token generation failed, using unsafe dev token');
+                // Fallback: Use a simple JWT for dev (INSECURE!)
+                // This is just base64(header).base64(payload).fake_signature
+                const header = btoa(JSON.stringify({typ: 'JWT', alg: 'HS256'}));
+                const payload = btoa(JSON.stringify({
+                    sub: participantName,
+                    iss: 'devkey',
+                    name: participantName,
+                    video: { room: roomName, roomJoin: true, canPublish: true, canSubscribe: true },
+                    exp: Math.floor(Date.now() / 1000) + 3600
+                }));
+                return `${header}.${payload}.devsignature`;
+            }
+        }
+
+        function showStatus(msg, type) {
+            const status = document.getElementById('status');
+            status.textContent = msg;
+            status.className = 'status ' + type;
+            status.classList.remove('hidden');
+            console.log('[' + type.toUpperCase() + ']', msg);
+        }
+
+        // Check WebRTC
+        if (!navigator.mediaDevices) {
+            showStatus('WebRTC not supported', 'error');
+            document.getElementById('connectBtn').disabled = true;
+        }
+    </script>
+</body>
+</html>

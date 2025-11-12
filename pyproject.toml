@@ -10,12 +10,10 @@ dependencies = [
     "torchvision==0.20.1",
     "torchaudio==2.5.1",
     "numpy==2.0.1",
-
     # Audio processing
     "librosa==0.10.2.post1",
     "soundfile==0.13.0",
     "audioread==3.0.1",
-
     # Image/Video processing
     "opencv-python-headless==4.10.0.84",
     "imageio==2.36.1",
@@ -23,30 +21,39 @@ dependencies = [
     "pillow>=11.0.0",
     "scikit-image==0.25.0",
     "tifffile>=2024.12.12",
-
     # Scientific computing
     "scipy==1.15.0",
     "scikit-learn==1.6.0",
     "numba==0.60.0",
-
     # Utilities
     "tqdm>=4.67.1",
     "filetype==1.2.0",
     "pyyaml>=6.0.2",
     "colored",
-
     # Build tools
     "cython>=3.0.11",
     "cffi>=1.17.1",
-
     # CUDA support (compatible with PyTorch 2.5.1+cu121)
     # Note: PyTorch already includes most CUDA dependencies
     # cuda-python 12.x required for TensorRT utilities (13.x has breaking API changes)
     "cuda-python>=12.0,<13.0",
-
     # TensorRT for CUDA 12.x (included by default for performance)
     "tensorrt-cu12==10.13.3.9",
     "polygraphy",
+    # WebRTC and streaming
+    "pipecat-ai>=0.0.1",
+    "livekit>=0.17.0",
+    "livekit-agents[google,openai,silero,turn-detector]~=1.2",
+    "aiortc>=1.9.0",
+    "av>=13.0.0",
+    "websockets>=13.0",
+    # Gemini Live API
+    "google-genai>=0.2.0",
+    "protobuf>=4.0.0",
+    "google-cloud-speech>=2.34.0",
+    "google-cloud-texttospeech>=2.33.0",
+    "dotenv>=0.9.9",
+    "livekit-plugins-noise-cancellation~=0.2",
 ]
 
 [project.optional-dependencies]
