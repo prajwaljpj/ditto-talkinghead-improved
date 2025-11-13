@@ -38,3 +38,6 @@ log/*
 !example/audio.wav
 !example/image.png
 /TensorRT-10.13.3.9/
+/.serena/
+/*.json
+/logs/
