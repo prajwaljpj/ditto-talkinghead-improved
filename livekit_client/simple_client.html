@@ -1,0 +1,233 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>LiveKit HD Avatar Agent Test</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        /* Ensuring video fills its container nicely */
+        #avatar-video {
+            border: 4px solid #007bff;
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.2);
+        }
+    </style>
+</head>
+<body class="bg-gray-100 flex flex-col items-center min-h-screen pt-10 font-sans">
+    <h1 class="text-3xl font-bold text-gray-800 mb-6">HD Avatar Agent Test Client</h1>
+    <p class="text-gray-600 mb-4">Click "Connect" to join the room and test the $1280 \times 720$ avatar stream.</p>
+
+    <div id="controls" class="p-4 bg-white rounded-lg shadow-md flex items-center space-x-4 mb-8">
+        <input type="text" id="identityInput" placeholder="Enter Your Name/ID" value="ClientUser-1"
+               class="p-2 border border-gray-300 rounded-lg focus:ring-blue-500 focus:border-blue-500 w-48">
+        <button id="connectButton"
+                class="bg-blue-600 text-white p-2 rounded-lg hover:bg-blue-700 transition duration-150 shadow-md disabled:bg-gray-400">
+            Connect
+        </button>
+        <button id="leaveButton" disabled
+                class="bg-red-500 text-white p-2 rounded-lg hover:bg-red-600 transition duration-150 shadow-md disabled:bg-gray-400">
+            Leave Room
+        </button>
+    </div>
+
+    <div id="room-container" class="relative bg-black rounded-xl overflow-hidden shadow-2xl" style="max-width: 1280px; width: 100%;">
+        <!-- The video element scales responsively while maintaining aspect ratio -->
+        <video id="avatar-video" autoplay playsinline
+               style="width: 100%; height: auto; aspect-ratio: 16/9;"></video>
+        <div id="status" class="absolute bottom-4 left-4 text-white font-semibold p-2 bg-black bg-opacity-70 rounded-md">Status: Disconnected</div>
+    </div>
+
+    <!-- LiveKit Client SDK -->
+    <script src="https://cdn.jsdelivr.net/npm/livekit-client@latest/dist/livekit-client.umd.min.js"
+            onerror="console.error('Failed to load LiveKit Client SDK'); document.getElementById('status').textContent = 'Status: Failed to load SDK'"></script>
+
+    <script>
+        // Wait for DOM and LiveKit SDK to load
+        let Room, RoomEvent, Track, createLocalAudioTrack;
+        let room = null;
+        const roomName = 'my-avatar-test-room';
+        const TOKEN_SERVER_URL = 'http://localhost:8000/token';
+        const LIVEKIT_URL = 'ws://localhost:7880';
+
+        let videoElement, leaveButton, connectButton, identityInput, statusElement;
+
+        // Initialize when DOM is ready and SDK is loaded
+        function initialize() {
+            // Check if LiveKit SDK loaded - try both possible global names
+            const LiveKitSDK = window.LivekitClient || window.LiveKitClient;
+            
+            if (!LiveKitSDK) {
+                console.error('LiveKit Client SDK failed to load. Check your network connection.');
+                console.log('Available globals:', Object.keys(window).filter(k => k.toLowerCase().includes('livekit')));
+                document.getElementById('status').textContent = 'Status: SDK failed to load';
+                return;
+            }
+
+            try {
+                ({ Room, RoomEvent, Track, createLocalAudioTrack } = LiveKitSDK);
+                console.log('✅ LiveKit SDK loaded successfully');
+            } catch (error) {
+                console.error('Error destructuring LiveKit SDK:', error);
+                console.log('Available in SDK:', Object.keys(LiveKitSDK || {}));
+                document.getElementById('status').textContent = 'Status: SDK initialization failed';
+                return;
+            }
+
+            // Get DOM elements
+            videoElement = document.getElementById('avatar-video');
+            leaveButton = document.getElementById('leaveButton');
+            connectButton = document.getElementById('connectButton');
+            identityInput = document.getElementById('identityInput');
+            statusElement = document.getElementById('status');
+
+            // Set up event listeners
+            connectButton.addEventListener('click', connectAndGetToken);
+            leaveButton.addEventListener('click', leaveRoom);
+
+            updateStatus('Ready to connect', 'bg-gray-600');
+        }
+
+        // Wait for both DOM and SDK to be ready
+        function waitForSDK() {
+            const LiveKitSDK = window.LivekitClient || window.LiveKitClient;
+            if (LiveKitSDK) {
+                initialize();
+            } else {
+                // Poll for SDK to load (max 5 seconds)
+                let attempts = 0;
+                const maxAttempts = 50;
+                const checkInterval = setInterval(() => {
+                    attempts++;
+                    const sdk = window.LivekitClient || window.LiveKitClient;
+                    if (sdk) {
+                        clearInterval(checkInterval);
+                        initialize();
+                    } else if (attempts >= maxAttempts) {
+                        clearInterval(checkInterval);
+                        console.error('LiveKit SDK did not load after 5 seconds');
+                        console.log('Available globals:', Object.keys(window).filter(k => k.toLowerCase().includes('livekit')));
+                        const statusEl = document.getElementById('status');
+                        if (statusEl) {
+                            statusEl.textContent = 'Status: SDK failed to load - check console';
+                        }
+                    }
+                }, 100);
+            }
+        }
+
+        if (document.readyState === 'loading') {
+            document.addEventListener('DOMContentLoaded', waitForSDK);
+        } else {
+            waitForSDK();
+        }
+
+        function updateStatus(message, color = 'bg-black') {
+            statusElement.textContent = `Status: ${message}`;
+            statusElement.className = `absolute bottom-4 left-4 text-white font-semibold p-2 ${color} bg-opacity-70 rounded-md`;
+        }
+
+        async function fetchToken(identity) {
+            updateStatus('Requesting token...', 'bg-yellow-600');
+            try {
+                const response = await fetch(TOKEN_SERVER_URL, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({ room: roomName, identity: identity })
+                });
+
+                if (!response.ok) {
+                    throw new Error(`Token server returned status ${response.status}`);
+                }
+                const data = await response.json();
+                return data.token;
+            } catch (error) {
+                console.error('Error fetching token:', error);
+                updateStatus('Token failed. Start token server!', 'bg-red-600');
+                throw error;
+            }
+        }
+
+        async function connectAndGetToken() {
+            const identity = identityInput.value.trim() || 'ClientUser';
+            if (!identity) return;
+
+            connectButton.disabled = true;
+
+            try {
+                const token = await fetchToken(identity);
+                await joinRoom(token);
+            } catch (error) {
+                connectButton.disabled = false;
+            }
+        }
+
+        async function joinRoom(token) {
+            room = new Room();
+
+            room
+                .on(RoomEvent.Disconnected, handleDisconnected)
+                .on(RoomEvent.TrackSubscribed, handleTrackSubscribed);
+
+            try {
+                updateStatus(`Connecting to ${roomName}...`, 'bg-yellow-600');
+                await room.connect(LIVEKIT_URL, token);
+
+                // Get local audio and publish it so the agent can hear you
+                const localAudioTrack = await createLocalAudioTrack({
+                    echoCancellation: true,
+                    noiseSuppression: true,
+                });
+                await room.localParticipant.publishTrack(localAudioTrack);
+
+                leaveButton.disabled = false;
+                updateStatus(`Connected as ${room.localParticipant.identity}. Speak now!`, 'bg-green-600');
+
+            } catch (error) {
+                console.error('Failed to connect:', error);
+                updateStatus('Connection failed. Check server/network.', 'bg-red-600');
+                room = null;
+            }
+        }
+
+        function leaveRoom() {
+            if (room) {
+                room.disconnect();
+            }
+        }
+
+        function handleDisconnected() {
+            console.log('Disconnected from room');
+            videoElement.srcObject = null;
+            leaveButton.disabled = true;
+            connectButton.disabled = false;
+            updateStatus('Disconnected', 'bg-black');
+            room = null;
+        }
+
+        function handleTrackSubscribed(track, publication, participant) {
+            // Find the agent's video track (published by the CustomAvatarWorker)
+            if (track.kind === Track.Kind.Video) {
+                if (participant.identity !== room.localParticipant.identity) {
+                    console.log(`✅ Subscribed to agent's video track: ${publication.trackName} from ${participant.identity}`);
+                    track.attach(videoElement);
+                    updateStatus(`Connected - Viewing ${participant.identity}'s video`, 'bg-green-600');
+                } else {
+                    console.log(`Ignoring local video track: ${publication.trackName}`);
+                }
+            } else if (track.kind === Track.Kind.Audio) {
+                if (participant.identity !== room.localParticipant.identity) {
+                    console.log(`✅ Subscribed to agent's audio track: ${publication.trackName}`);
+                    // Audio will play automatically
+                    const audioElement = track.attach();
+                    audioElement.volume = 1.0;
+                    document.body.appendChild(audioElement);
+                } else {
+                    console.log(`Ignoring local audio track: ${publication.trackName}`);
+                }
+            }
+        }
+    </script>
+</body>
+</html>
