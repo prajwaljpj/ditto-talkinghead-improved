@@ -40,7 +40,7 @@ SOURCE_PATH = os.environ.get("SOURCE_PATH", "./assets/source_image.png")
 
 AVATAR_WIDTH = int(os.environ.get("AVATAR_WIDTH", "1280"))
 AVATAR_HEIGHT = int(os.environ.get("AVATAR_HEIGHT", "720"))
-AVATAR_FPS = int(os.environ.get("AVATAR_FPS", "50"))
+AVATAR_FPS = int(os.environ.get("AVATAR_FPS", "25"))
 
 
 @utils.log_exceptions(logger=logger)
@@ -59,25 +59,6 @@ async def main(api_url: str, api_token: str):
     logger.info(f"  Data Root: {DATA_ROOT}")
     logger.info(f"  Resolution: {AVATAR_WIDTH}x{AVATAR_HEIGHT} @ {AVATAR_FPS}fps")
 
-    # Connect to the room
-    room = rtc.Room()
-    await room.connect(api_url, api_token)
-    logger.info(f"✅ Connected to room: {room.name}")
-
-    should_stop = asyncio.Event()
-
-    # Stop when agent disconnects or room disconnects
-    @room.on("participant_disconnected")
-    def _on_participant_disconnected(participant: rtc.RemoteParticipant):
-        if participant.kind == rtc.ParticipantKind.PARTICIPANT_KIND_AGENT:
-            logger.info(f"Agent {participant.identity} disconnected, stopping avatar worker")
-            should_stop.set()
-
-    @room.on("disconnected")
-    def _on_disconnected():
-        logger.info("Room disconnected, stopping avatar worker")
-        should_stop.set()
-
     # Define avatar options
     avatar_options = AvatarOptions(
         video_width=AVATAR_WIDTH,
@@ -95,6 +76,27 @@ async def main(api_url: str, api_token: str):
         cfg_pkl=CFG_PKL,
         source_path=SOURCE_PATH,
     )
+
+    # Connect to the room
+    room = rtc.Room()
+    await room.connect(api_url, api_token)
+    logger.info(f"✅ Connected to room: {room.name}")
+
+    should_stop = asyncio.Event()
+
+    # Stop when agent disconnects or room disconnects
+    @room.on("participant_disconnected")
+    def _on_participant_disconnected(participant: rtc.RemoteParticipant):
+        if participant.kind == rtc.ParticipantKind.PARTICIPANT_KIND_AGENT:
+            logger.info(
+                f"Agent {participant.identity} disconnected, stopping avatar worker"
+            )
+            should_stop.set()
+
+    @room.on("disconnected")
+    def _on_disconnected():
+        logger.info("Room disconnected, stopping avatar worker")
+        should_stop.set()
 
     # Create avatar runner with DataStream audio receiver
     logger.info("Creating AvatarRunner...")

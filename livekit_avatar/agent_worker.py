@@ -45,7 +45,7 @@ CFG_PKL = os.environ.get("CFG_PKL", "./checkpoints/ditto_cfg/v0.4_hubert_cfg_trt
 SOURCE_PATH = os.environ.get("SOURCE_PATH", "./assets/source_image.png")
 AVATAR_WIDTH = os.environ.get("AVATAR_WIDTH", "1280")
 AVATAR_HEIGHT = os.environ.get("AVATAR_HEIGHT", "720")
-AVATAR_FPS = os.environ.get("AVATAR_FPS", "50")
+AVATAR_FPS = os.environ.get("AVATAR_FPS", "25")
 
 # Avatar worker identity
 AVATAR_IDENTITY = "avatar_worker"
