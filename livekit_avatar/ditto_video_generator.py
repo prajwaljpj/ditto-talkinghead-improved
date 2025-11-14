@@ -223,16 +223,15 @@ class DittoVideoGenerator(VideoGenerator):
                 self._audio_queue.task_done()
                 logger.debug(f"📥 Received frame from queue: {type(frame).__name__}")
             except asyncio.TimeoutError:
-                # No TTS audio available - generate silent audio for idle state
-                # Generate multiple silent frames to keep Ditto running during idle
-                # This prevents video freeze during listening mode
-                logger.info("⏰ Queue timeout - starting idle frame generation")
+                # No TTS audio available - enter continuous idle generation mode
+                # Keep generating idle frames until TTS audio arrives
+                logger.info("⏰ Queue timeout - entering continuous idle mode")
                 try:
-                    async for frame in self._generate_idle_frames():
+                    async for frame in self._generate_continuous_idle():
                         yield frame
-                    logger.info("✅ Idle frame generation complete")
+                    logger.info("✅ Exiting idle mode (TTS audio available)")
                 except Exception as e:
-                    logger.error(f"❌ Error in idle frame generation: {e}", exc_info=True)
+                    logger.error(f"❌ Error in idle generation: {e}", exc_info=True)
                 continue
 
             # Handle AudioSegmentEnd (marks end of TTS segment)
@@ -313,6 +312,108 @@ class DittoVideoGenerator(VideoGenerator):
                     yield video_frame
                 except asyncio.TimeoutError:
                     logger.debug("Timeout waiting for video frame from Ditto")
+
+    async def _generate_continuous_idle(self):
+        """
+        Continuously generate idle frames until TTS audio arrives.
+
+        This keeps the video stream running smoothly during listening mode
+        without gaps between idle generation cycles.
+        """
+        # Pre-fill buffer once at the start
+        logger.info("🎬 Pre-filling buffer for continuous idle mode")
+        async for frame in self._prefill_idle_buffer():
+            yield frame
+
+        frames_generated = 0
+        while True:
+            # Check if TTS audio has arrived (non-blocking)
+            if not self._audio_queue.empty():
+                logger.info(f"🎯 TTS audio detected, exiting idle mode (generated {frames_generated} idle frames)")
+                return
+
+            # Generate one idle frame
+            silent_frame = self._create_silent_audio_frame()
+            synced_audio_frames = self._audio_bstream.push(silent_frame.data)
+
+            for synced_audio_frame in synced_audio_frames:
+                # Convert to float32 for Ditto
+                audio_data_int16 = np.frombuffer(synced_audio_frame.data, dtype=np.int16)
+                audio_data_float = audio_data_int16.astype(np.float32) / 32768.0
+
+                # Add to Ditto's buffer
+                self._sdk_audio_buffer = np.concatenate([self._sdk_audio_buffer, audio_data_float])
+
+                # Process Ditto buffer when we have enough samples
+                if len(self._sdk_audio_buffer) >= self.split_len:
+                    ditto_chunk = self._sdk_audio_buffer[: self.split_len]
+                    self._sdk_audio_buffer = self._sdk_audio_buffer[self.chunksize[1] * 640 :]
+
+                    # Feed to Ditto (non-blocking)
+                    async with self._sdk_lock:
+                        await self._loop.run_in_executor(
+                            None, self.sdk.run_chunk, ditto_chunk, self.chunksize
+                        )
+
+                # Yield audio frame
+                yield synced_audio_frame
+                frames_generated += 1
+
+                # Yield video frame
+                try:
+                    video_frame = await asyncio.wait_for(
+                        self._video_frame_queue.get(),
+                        timeout=0.1
+                    )
+                    yield video_frame
+                    frames_generated += 1
+                except asyncio.TimeoutError:
+                    logger.debug(f"⏰ Video frame timeout at idle frame {frames_generated}")
+
+    async def _prefill_idle_buffer(self):
+        """Pre-fill the audio buffer to trigger initial Ditto call."""
+        samples_per_frame = self._options.audio_sample_rate // self._options.video_fps
+        frames_to_prefill = (self.split_len // samples_per_frame) + 1
+
+        logger.debug(f"  📦 Pre-filling with {frames_to_prefill} frames")
+
+        buffered_frames = []
+        for i in range(frames_to_prefill):
+            silent_frame = self._create_silent_audio_frame()
+            synced_audio_frames = self._audio_bstream.push(silent_frame.data)
+
+            for synced_audio_frame in synced_audio_frames:
+                audio_data_int16 = np.frombuffer(synced_audio_frame.data, dtype=np.int16)
+                audio_data_float = audio_data_int16.astype(np.float32) / 32768.0
+
+                self._sdk_audio_buffer = np.concatenate([self._sdk_audio_buffer, audio_data_float])
+                buffered_frames.append(synced_audio_frame)
+
+                if len(self._sdk_audio_buffer) >= self.split_len:
+                    ditto_chunk = self._sdk_audio_buffer[: self.split_len]
+                    self._sdk_audio_buffer = self._sdk_audio_buffer[self.chunksize[1] * 640 :]
+
+                    logger.debug(f"  🎨 Initial Ditto call (queue: {self._video_frame_queue.qsize()})")
+                    async with self._sdk_lock:
+                        await self._loop.run_in_executor(
+                            None, self.sdk.run_chunk, ditto_chunk, self.chunksize
+                        )
+
+        # Wait for callbacks to populate queue
+        await asyncio.sleep(0.05)
+        logger.debug(f"  ✅ Pre-fill complete, queue has {self._video_frame_queue.qsize()} frames")
+
+        # Yield buffered frames
+        for audio_frame in buffered_frames:
+            yield audio_frame
+            try:
+                video_frame = await asyncio.wait_for(
+                    self._video_frame_queue.get(),
+                    timeout=0.1
+                )
+                yield video_frame
+            except asyncio.TimeoutError:
+                logger.debug("  ⏰ Timeout during pre-fill yield")
 
     async def _generate_idle_frames(self):
         """
