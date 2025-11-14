@@ -307,7 +307,12 @@ class DittoVideoGenerator(VideoGenerator):
             ditto_chunk = self._sdk_audio_buffer[:self.split_len]
             self._sdk_audio_buffer = self._sdk_audio_buffer[self.chunksize[1] * 640:]
 
-            logger.debug(f"🎨 Feeding {len(ditto_chunk)} samples to Ditto (buffered {len(buffered_audio_chunks)} audio chunks)")
+            # Calculate expected video frames from this chunk
+            # 6480 samples / 640 samples per frame = 10.125 → 10 frames
+            samples_per_frame = self._options.audio_sample_rate // self._options.video_fps
+            expected_video_frames = self.split_len // samples_per_frame
+
+            logger.debug(f"🎨 Feeding {len(ditto_chunk)} samples to Ditto (buffered {len(buffered_audio_chunks)} chunks, expect {expected_video_frames} video frames)")
             start_time = time.time()
             async with self._sdk_lock:
                 await self._loop.run_in_executor(
@@ -316,19 +321,33 @@ class DittoVideoGenerator(VideoGenerator):
             elapsed = (time.time() - start_time) * 1000
             logger.debug(f"✅ Ditto complete in {elapsed:.1f}ms (queue: {self._video_frame_queue.qsize()})")
 
-            # Yield buffered audio chunks with corresponding video frames (1:1 ratio)
-            for audio_chunk in buffered_audio_chunks:
+            # Give Ditto callbacks time to populate video queue
+            await asyncio.sleep(0.05)  # 50ms for frames to arrive
+            logger.debug(f"📦 Video queue ready: {self._video_frame_queue.qsize()} frames")
+
+            # Yield buffered audio chunks with corresponding video frames
+            # Only yield up to expected_video_frames to maintain 1:1 ratio
+            frames_yielded = 0
+            for i, audio_chunk in enumerate(buffered_audio_chunks):
+                # Stop if we've yielded all expected video frames
+                if frames_yielded >= expected_video_frames:
+                    logger.debug(f"✋ Stopping at {frames_yielded} frames (matched expected {expected_video_frames})")
+                    break
+
                 yield audio_chunk
+                frames_yielded += 1
 
                 # Get corresponding video frame
                 try:
                     video_frame = await asyncio.wait_for(
                         self._video_frame_queue.get(),
-                        timeout=0.5
+                        timeout=0.1  # Shorter timeout since frames should be ready
                     )
                     yield video_frame
                 except asyncio.TimeoutError:
-                    logger.warning(f"⏰ Timeout waiting for video frame (queue: {self._video_frame_queue.qsize()})")
+                    logger.warning(f"⏰ Timeout waiting for video frame {frames_yielded} (queue: {self._video_frame_queue.qsize()})")
+                    # Stop yielding if video frames aren't available
+                    break
 
     def _create_silent_audio_frame(self) -> rtc.AudioFrame:
         """Create a silent audio frame for idle state."""
