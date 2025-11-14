@@ -50,6 +50,7 @@
         const LIVEKIT_URL = 'ws://localhost:7880';
 
         let videoElement, leaveButton, connectButton, identityInput, statusElement;
+        let currentAudioElement = null;  // Track current audio element
 
         // Initialize when DOM is ready and SDK is loaded
         function initialize() {
@@ -200,6 +201,15 @@
         function handleDisconnected() {
             console.log('Disconnected from room');
             videoElement.srcObject = null;
+
+            // Clean up audio element
+            if (currentAudioElement) {
+                currentAudioElement.pause();
+                currentAudioElement.srcObject = null;
+                currentAudioElement.remove();
+                currentAudioElement = null;
+            }
+
             leaveButton.disabled = true;
             connectButton.disabled = false;
             updateStatus('Disconnected', 'bg-black');
@@ -218,11 +228,33 @@
                 }
             } else if (track.kind === Track.Kind.Audio) {
                 if (participant.identity !== room.localParticipant.identity) {
-                    console.log(`✅ Subscribed to agent's audio track: ${publication.trackName}`);
-                    // Audio will play automatically
-                    const audioElement = track.attach();
-                    audioElement.volume = 1.0;
-                    document.body.appendChild(audioElement);
+                    console.log(`✅ Subscribed to audio track: ${publication.trackName} from ${participant.identity}`);
+
+                    // ONLY play audio from avatar_worker to avoid duplicate audio
+                    // Agent worker should NOT publish audio (uses DataStream instead)
+                    if (participant.identity === 'avatar_worker') {
+                        console.log(`🔊 Playing audio from avatar: ${publication.trackName}`);
+
+                        // Remove old audio element if it exists (prevents accumulation)
+                        if (currentAudioElement) {
+                            console.log('🗑️ Removing old audio element');
+                            currentAudioElement.pause();
+                            currentAudioElement.srcObject = null;
+                            currentAudioElement.remove();
+                        }
+
+                        // Create and attach new audio element
+                        const audioElement = track.attach();
+                        audioElement.volume = 1.0;
+                        document.body.appendChild(audioElement);
+                        currentAudioElement = audioElement;
+
+                        // Debug: Count total audio elements
+                        const totalAudioElements = document.querySelectorAll('audio').length;
+                        console.log(`📊 Total audio elements in DOM: ${totalAudioElements}`);
+                    } else {
+                        console.log(`⚠️ Ignoring audio from ${participant.identity} - only avatar audio should play`);
+                    }
                 } else {
                     console.log(`Ignoring local audio track: ${publication.trackName}`);
                 }

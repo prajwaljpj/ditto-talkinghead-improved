@@ -49,6 +49,11 @@ export SOURCE_PATH=${DITTO_SOURCE:-avatars/Hyperrealistic_Indian_Woman_Professio
 echo "==================================================="
 echo "Starting LiveKit + Vertex AI + Custom Avatar Agent"
 echo "==================================================="
+echo "Architecture: Two-Worker System"
+echo "  1. Agent Worker: Conversation (STT, LLM, TTS)"
+echo "  2. Avatar Worker: Video Generation (Ditto)"
+echo "  Audio sent via DataStream (agent → avatar)"
+echo "==================================================="
 echo "LiveKit Server:  $LIVEKIT_URL"
 echo ""
 echo "Avatar Config:"
@@ -77,8 +82,9 @@ if ! uv run python -c "import google.genai" 2>/dev/null; then
     uv add google-genai
 fi
 
-# --- 5. RUN THE MAIN AGENT ---
-echo "Starting agent..."
+# --- 5. RUN THE AGENT WORKER ---
+echo "Starting agent worker..."
+echo "(Avatar worker will be launched automatically as subprocess)"
 echo ""
-# Execute your main agent file
-uv run python livekit_avatar/main_agent.py dev
+# Execute the agent worker (which launches avatar worker)
+uv run python livekit_avatar/agent_worker.py dev
