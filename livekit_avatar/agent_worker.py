@@ -52,8 +52,7 @@ AVATAR_IDENTITY = "avatar_worker"
 
 
 async def launch_avatar_worker(
-    ctx: agents.JobContext,
-    avatar_identity: str
+    ctx: agents.JobContext, avatar_identity: str
 ) -> subprocess.Popen:
     """
     Launch the avatar worker as a subprocess.
@@ -130,7 +129,7 @@ async def entrypoint(ctx: agents.JobContext):
         project=GCP_PROJECT_ID,
         location=GCP_REGION,
         model=GEMINI_MODEL,
-        voice="Charon",
+        voice="Kore",
     )
 
     # Create the voice agent with instructions
@@ -138,7 +137,7 @@ async def entrypoint(ctx: agents.JobContext):
         instructions=(
             "You are a helpful AI assistant with an animated avatar. "
             "Keep your responses conversational and concise. "
-            "Speak naturally as if you're having a face-to-face conversation."
+            "Speak naturally in an Indian accent as if you're having a face-to-face conversation."
         ),
     )
 
@@ -198,6 +197,7 @@ async def entrypoint(ctx: agents.JobContext):
 
     # Keep the agent running until the room disconnects
     try:
+
         async def wait_until_disconnected():
             while ctx.room.connection_state == rtc.ConnectionState.CONN_CONNECTED:
                 await asyncio.sleep(1)
