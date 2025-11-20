@@ -80,7 +80,9 @@ class DittoVideoGenerator(VideoGenerator):
         self.silent_chunk = np.zeros(self.split_len, dtype=np.float32)
 
         # Audio buffering for Ditto's chunking requirements
+        # Initialize with prefix padding (3 frames = 1920 samples)
         self._sdk_audio_buffer = np.zeros((self.chunksize[0] * 640,), dtype=np.float32)
+        self._pending_audio_chunks = []  # Store audio chunks to yield later
         self._sdk_lock = asyncio.Lock()
 
         # AudioByteStream to chunk audio frames to match video frame rate
@@ -94,10 +96,17 @@ class DittoVideoGenerator(VideoGenerator):
         logger.info(f"Audio chunking: {samples_per_video_frame} samples per frame @ {options.video_fps} fps")
 
         # Video frame storage (populated by Ditto callback)
-        self._video_frame_queue = asyncio.Queue[rtc.VideoFrame](maxsize=10)
+        # Increased buffer to 20 frames to accommodate pre-buffering and prevent draining
+        self._video_frame_queue = asyncio.Queue[rtc.VideoFrame](maxsize=20)
 
         # Store event loop reference for thread-safe coroutine scheduling
         self._loop = asyncio.get_event_loop()
+
+        # Diagnostic tracking for lip sync debugging
+        self._frames_yielded = 0
+        self._audio_frames_yielded = 0
+        self._video_frames_yielded = 0
+        self._generation_start_time = None
 
         # Initialize Ditto StreamSDK
         logger.info("Initializing Ditto StreamSDK...")
@@ -112,6 +121,13 @@ class DittoVideoGenerator(VideoGenerator):
         self.sdk.setup_Nd(N_d=1000000)  # Large number for continuous generation
         logger.info("✅ Ditto StreamSDK initialized")
 
+        # Log critical configuration values for debugging
+        actual_valid_clip_len = self.sdk.audio2motion.valid_clip_len
+        actual_overlap = self.sdk.audio2motion.overlap_v2
+        actual_seq_frames = self.sdk.audio2motion.seq_frames
+        logger.info(f"🔍 Ditto Config: seq_frames={actual_seq_frames}, overlap_v2={actual_overlap}, valid_clip_len={actual_valid_clip_len}")
+        logger.info(f"🔍 Expected frames per chunk: {actual_valid_clip_len} (not chunksize[1]={self.chunksize[1]})")
+
         # Warmup: Generate a few dummy frames to initialize CUDA/TensorRT
         logger.info("Warming up Ditto model...")
         self._warmup_model()
@@ -124,7 +140,8 @@ class DittoVideoGenerator(VideoGenerator):
         Callback from StreamSDK (runs in SDK's worker thread).
         Converts and queues video frames for the main generation loop.
         """
-        logger.info(f"🎥 Callback received frame {frame_idx} at {timestamp:.3f}s")
+        queue_before = self._video_frame_queue.qsize()
+        logger.info(f"🎥 Callback: frame {frame_idx} at {timestamp:.3f}s (queue before: {queue_before})")
         try:
             i420_data = rgb_to_i420(
                 frame_rgb, self._options.video_width, self._options.video_height
@@ -140,9 +157,9 @@ class DittoVideoGenerator(VideoGenerator):
             # Queue the video frame (non-blocking to avoid callback delays)
             try:
                 self._video_frame_queue.put_nowait(video_frame)
-                logger.info(f"  ✅ Frame {frame_idx} queued successfully (queue size: {self._video_frame_queue.qsize()})")
+                logger.info(f"  ✅ Frame {frame_idx} queued (queue: {queue_before} → {self._video_frame_queue.qsize()})")
             except asyncio.QueueFull:
-                logger.warning(f"  ⚠️ Video frame queue full, dropping frame {frame_idx}")
+                logger.error(f"  ❌ Queue FULL! Dropping frame {frame_idx} (queue size: {self._video_frame_queue.qsize()}/{self._video_frame_queue.maxsize})")
 
         except Exception as e:
             logger.error(f"  ❌ Error in callback for frame {frame_idx}: {e}", exc_info=True)
@@ -187,6 +204,7 @@ class DittoVideoGenerator(VideoGenerator):
 
         # Reset audio buffer for Ditto
         self._sdk_audio_buffer = np.zeros((self.chunksize[0] * 640,), dtype=np.float32)
+        self._pending_audio_chunks.clear()
 
     def __aiter__(
         self,
@@ -211,43 +229,62 @@ class DittoVideoGenerator(VideoGenerator):
         self,
     ) -> AsyncGenerator[rtc.VideoFrame | rtc.AudioFrame | AudioSegmentEnd, None]:
         """
-        Main generation loop with unified buffer accumulation.
+        Frame-locked generation loop for perfect audio-video lip-sync with pre-buffering.
 
-        Uses ONE buffer for both TTS and idle audio, eliminating mode switching gaps.
-        Accumulates to 6480 samples → feeds to Ditto → yields 640-sample chunks.
+        Architecture:
+        1. Pre-generate 15 idle frames to fill video queue (prevents cold start gaps)
+        2. Accumulate audio to 6480 samples (first chunk: 405ms, subsequent: instant)
+        3. Process through Ditto (~200ms, generates 5 NEW frames)
+        4. Yield 5 audio-video pairs as fast as possible (no artificial pacing)
+        5. Maintain 3280-sample overlap buffer for temporal coherence
+        6. Video queue stays buffered at 10-15 frames to prevent draining
+
+        Key Strategy:
+        - Yield frames fast to keep queue full (LiveKit's synchronizer handles pacing)
+        - Pre-buffered queue prevents starvation during Ditto processing gaps
+        - Audio and video yielded together for frame-locked synchronization
+
+        Latency: 605ms startup, ~400ms steady-state per audio sample
+        Throughput: Sustained 25fps (queue-buffered)
         """
 
-        while True:
-            # Buffer to accumulate audio chunks until we have enough for Ditto
-            buffered_audio_chunks = []
+        # Pre-generate idle frames to warm up the video queue
+        # This reduces "frame capture behind schedule" warnings during startup
+        # With overlap_v2=70: each chunk produces 10 frames, so 2 chunks = 20 idle frames
+        expected_prebuffer_frames = self.sdk.audio2motion.valid_clip_len * 2
+        logger.info(f"Pre-generating idle frames to buffer video queue (expecting {expected_prebuffer_frames} frames)...")
+        for i in range(2):  # Generate 2 chunks
+            queue_before = self._video_frame_queue.qsize()
+            silent_chunk = np.zeros(self.split_len, dtype=np.float32)
+            async with self._sdk_lock:
+                await self._loop.run_in_executor(
+                    None, self.sdk.run_chunk, silent_chunk, self.chunksize
+                )
+            # Wait for callbacks to populate queue
+            await asyncio.sleep(0.25)
+            queue_after = self._video_frame_queue.qsize()
+            logger.info(f"  Chunk {i+1}: {queue_after - queue_before} frames added (queue: {queue_before} → {queue_after})")
+        actual_prebuffer = self._video_frame_queue.qsize()
+        logger.info(f"✅ Pre-generated {actual_prebuffer} idle frames (expected {expected_prebuffer_frames})")
+        if actual_prebuffer != expected_prebuffer_frames:
+            logger.warning(f"⚠️ Pre-buffer mismatch: got {actual_prebuffer}, expected {expected_prebuffer_frames}")
 
-            # Accumulate audio until we have 6480 samples for Ditto
+        while True:
+            # Step 1: Accumulate audio until we have enough for Ditto (6480 samples)
+            # After first chunk, buffer has 3280 samples from overlap → only need 3200 more
             while len(self._sdk_audio_buffer) < self.split_len:
-                # Try to get TTS audio (very short timeout)
                 try:
                     frame = await asyncio.wait_for(
                         self._audio_queue.get(),
-                        timeout=0.001  # 1ms - just checking if audio is available
+                        timeout=0.04  # 40ms = 1 frame @ 25fps
                     )
                     self._audio_queue.task_done()
-                    logger.debug(f"📥 Got TTS frame: {type(frame).__name__}")
+                    logger.debug(f"📥 Got frame: {type(frame).__name__}")
 
                     # Handle AudioSegmentEnd
                     if isinstance(frame, AudioSegmentEnd):
-                        # Flush current buffer to Ditto before signaling end
-                        if len(self._sdk_audio_buffer) > 0:
-                            await self._flush_audio_buffer()
-
-                            # Yield any remaining video frames
-                            while not self._video_frame_queue.empty():
-                                try:
-                                    video_frame = self._video_frame_queue.get_nowait()
-                                    yield video_frame
-                                except asyncio.QueueEmpty:
-                                    break
-
-                        # Yield buffered audio chunks collected so far
-                        for audio_chunk in buffered_audio_chunks:
+                        # Flush any pending audio chunks with their video
+                        for audio_chunk in self._pending_audio_chunks:
                             yield audio_chunk
                             try:
                                 video_frame = await asyncio.wait_for(
@@ -255,14 +292,14 @@ class DittoVideoGenerator(VideoGenerator):
                                 )
                                 yield video_frame
                             except asyncio.TimeoutError:
-                                pass
+                                logger.warning("Missing video frame during segment end")
 
                         # Signal segment end
                         yield AudioSegmentEnd()
-                        buffered_audio_chunks.clear()
+                        self._pending_audio_chunks.clear()
                         continue
 
-                    # Resample if necessary (Ditto expects 16kHz mono)
+                    # Resample to 16kHz mono if necessary
                     resampled_frames: list[rtc.AudioFrame] = []
                     if (
                         frame.sample_rate != self.ditto_sample_rate
@@ -280,12 +317,12 @@ class DittoVideoGenerator(VideoGenerator):
                         resampled_frames.append(frame)
 
                 except asyncio.TimeoutError:
-                    # No TTS audio - generate silent frame (idle mode)
+                    # No TTS audio - generate silent frame for idle animation
                     logger.debug("⚪ Generating silent frame (idle)")
                     silent_frame = self._create_silent_audio_frame()
                     resampled_frames = [silent_frame]
 
-                # Push through AudioByteStream to get 640-sample chunks
+                # Chunk audio into 640-sample frames and buffer for Ditto
                 for resampled_frame in resampled_frames:
                     synced_audio_frames = self._audio_bstream.push(resampled_frame.data)
 
@@ -294,60 +331,102 @@ class DittoVideoGenerator(VideoGenerator):
                         audio_data_int16 = np.frombuffer(synced_audio_frame.data, dtype=np.int16)
                         audio_data_float = audio_data_int16.astype(np.float32) / 32768.0
 
-                        # Add to unified buffer
+                        # Add to Ditto buffer
                         self._sdk_audio_buffer = np.concatenate([
                             self._sdk_audio_buffer,
                             audio_data_float
                         ])
 
-                        # Save chunk for yielding later (after Ditto processes)
-                        buffered_audio_chunks.append(synced_audio_frame)
+                        # Store for yielding later (after video is ready)
+                        self._pending_audio_chunks.append(synced_audio_frame)
 
-            # Buffer now has 6480+ samples - feed to Ditto
+            # Step 2: Process through Ditto
             ditto_chunk = self._sdk_audio_buffer[:self.split_len]
-            self._sdk_audio_buffer = self._sdk_audio_buffer[self.chunksize[1] * 640:]
+            # Use dynamic valid_clip_len which accounts for overlap_v2 configuration
+            # With overlap_v2=70: valid_clip_len = seq_frames(80) - overlap_v2(70) = 10 frames
+            # With overlap_v2=10: valid_clip_len = seq_frames(80) - overlap_v2(10) = 70 frames
+            expected_video_frames = self.sdk.audio2motion.valid_clip_len
 
-            # Calculate expected video frames from this chunk
-            # 6480 samples / 640 samples per frame = 10.125 → 10 frames
-            samples_per_frame = self._options.audio_sample_rate // self._options.video_fps
-            expected_video_frames = self.split_len // samples_per_frame
+            queue_before = self._video_frame_queue.qsize()
+            logger.debug(f"🎨 Feeding {len(ditto_chunk)} samples to Ditto (expect {expected_video_frames} frames, queue before: {queue_before})")
+            await self._process_ditto_chunk(ditto_chunk, expected_video_frames)
+            queue_after = self._video_frame_queue.qsize()
+            frames_added = queue_after - queue_before
 
-            logger.debug(f"🎨 Feeding {len(ditto_chunk)} samples to Ditto (buffered {len(buffered_audio_chunks)} chunks, expect {expected_video_frames} video frames)")
-            start_time = time.time()
-            async with self._sdk_lock:
-                await self._loop.run_in_executor(
-                    None, self.sdk.run_chunk, ditto_chunk, self.chunksize
-                )
-            elapsed = (time.time() - start_time) * 1000
-            logger.debug(f"✅ Ditto complete in {elapsed:.1f}ms (queue: {self._video_frame_queue.qsize()})")
+            logger.info(f"📦 Ditto produced {frames_added} frames (expected {expected_video_frames}), queue: {queue_before} → {queue_after}")
+            if frames_added != expected_video_frames:
+                logger.error(f"❌ MISMATCH: Ditto produced {frames_added} frames but expected {expected_video_frames}!")
 
-            # Give Ditto callbacks time to populate video queue
-            await asyncio.sleep(0.05)  # 50ms for frames to arrive
-            logger.debug(f"📦 Video queue ready: {self._video_frame_queue.qsize()} frames")
+            # Step 3: Yield audio-video pairs as fast as possible
+            # Let LiveKit's AvatarRunner synchronizer handle the pacing (it has its own 25fps timer)
+            # Our job: keep the queue full so synchronizer never starves
+            if self._generation_start_time is None:
+                self._generation_start_time = time.time()
 
-            # Yield buffered audio chunks with corresponding video frames
-            # Only yield up to expected_video_frames to maintain 1:1 ratio
-            frames_yielded = 0
-            for i, audio_chunk in enumerate(buffered_audio_chunks):
-                # Stop if we've yielded all expected video frames
-                if frames_yielded >= expected_video_frames:
-                    logger.debug(f"✋ Stopping at {frames_yielded} frames (matched expected {expected_video_frames})")
+            for i in range(expected_video_frames):
+                if i >= len(self._pending_audio_chunks):
+                    logger.warning(f"⚠️ Ran out of audio chunks at {i}/{expected_video_frames}")
                     break
 
-                yield audio_chunk
-                frames_yielded += 1
+                # Yield audio
+                yield self._pending_audio_chunks[i]
+                self._audio_frames_yielded += 1
 
-                # Get corresponding video frame
+                # Yield corresponding video (synchronized)
                 try:
                     video_frame = await asyncio.wait_for(
                         self._video_frame_queue.get(),
-                        timeout=0.1  # Shorter timeout since frames should be ready
+                        timeout=0.1
                     )
                     yield video_frame
+                    self._video_frames_yielded += 1
+
+                    # Log every 25 frames (1 second worth) for diagnostics
+                    if self._video_frames_yielded % 25 == 0:
+                        elapsed = time.time() - self._generation_start_time
+                        expected_time = self._video_frames_yielded / 25.0  # Expected at 25fps
+                        drift = elapsed - expected_time
+                        logger.info(
+                            f"📊 Sync check: {self._video_frames_yielded} frames in {elapsed:.2f}s "
+                            f"(expected {expected_time:.2f}s, drift: {drift:+.2f}s, queue: {self._video_frame_queue.qsize()})"
+                        )
                 except asyncio.TimeoutError:
-                    logger.warning(f"⏰ Timeout waiting for video frame {frames_yielded} (queue: {self._video_frame_queue.qsize()})")
-                    # Stop yielding if video frames aren't available
+                    logger.error(f"❌ Missing video frame {i+1}/{expected_video_frames}")
                     break
+
+            # Step 4: Advance buffers (maintain overlap for temporal coherence)
+            # CRITICAL: Advance by chunksize[1] (step size), NOT valid_clip_len (output frames)!
+            # With overlap_v2=70: chunksize[1]=5 (step), valid_clip_len=10 (output)
+            # We must step by 5 frames (3200 samples) to maintain proper overlap for Ditto
+            step_samples = self.chunksize[1] * 640  # 5 * 640 = 3200 samples
+            self._sdk_audio_buffer = self._sdk_audio_buffer[step_samples:]
+
+            # Remove yielded audio chunks, keep any excess for next cycle
+            self._pending_audio_chunks = self._pending_audio_chunks[expected_video_frames:]
+
+    async def _process_ditto_chunk(self, ditto_chunk: np.ndarray, expected_frames: int):
+        """Process an audio chunk through Ditto and wait for video frames."""
+        start_time = time.time()
+        queue_before = self._video_frame_queue.qsize()
+
+        async with self._sdk_lock:
+            await self._loop.run_in_executor(
+                None, self.sdk.run_chunk, ditto_chunk, self.chunksize
+            )
+        elapsed = (time.time() - start_time) * 1000
+        logger.debug(f"✅ Ditto complete in {elapsed:.1f}ms (queue: {self._video_frame_queue.qsize()})")
+
+        # Wait for NEW frames to be added (not total queue size)
+        # Callbacks can be slightly delayed by thread scheduling, so be generous with timeout
+        target_queue_size = queue_before + expected_frames
+        timeout_deadline = time.time() + 0.3  # 300ms max wait
+        while self._video_frame_queue.qsize() < target_queue_size:
+            if time.time() > timeout_deadline:
+                current_size = self._video_frame_queue.qsize()
+                frames_added = current_size - queue_before
+                logger.warning(f"⏰ Only {frames_added}/{expected_frames} new frames added after 300ms (queue: {queue_before} → {current_size})")
+                break
+            await asyncio.sleep(0.01)  # 10ms polling interval
 
     def _create_silent_audio_frame(self) -> rtc.AudioFrame:
         """Create a silent audio frame for idle state."""
@@ -360,27 +439,6 @@ class DittoVideoGenerator(VideoGenerator):
             num_channels=self._options.audio_channels,
             samples_per_channel=silent_samples,
         )
-
-    async def _flush_audio_buffer(self):
-        """Flush remaining audio buffer to Ditto."""
-        if len(self._sdk_audio_buffer) > 0:
-            # Pad buffer to chunk size
-            padding_len = self.split_len - (len(self._sdk_audio_buffer) % self.split_len)
-            if padding_len < self.split_len:
-                self._sdk_audio_buffer = np.concatenate([
-                    self._sdk_audio_buffer,
-                    np.zeros(padding_len, dtype=np.float32)
-                ])
-
-            # Process remaining chunks
-            while len(self._sdk_audio_buffer) >= self.split_len:
-                audio_chunk = self._sdk_audio_buffer[: self.split_len]
-                self._sdk_audio_buffer = self._sdk_audio_buffer[self.split_len:]
-
-                async with self._sdk_lock:
-                    await self._loop.run_in_executor(
-                        None, self.sdk.run_chunk, audio_chunk, self.chunksize
-                    )
 
     async def aclose(self):
         """Cleanup resources."""

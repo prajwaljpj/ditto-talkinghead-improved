@@ -177,6 +177,36 @@ async def entrypoint(ctx: agents.JobContext):
 
     # Start the AgentSession with audio output disabled
     # The avatar worker will publish the audio, not this agent
+    logger.info("Starting AgentSession...")
+    logger.info(f"  LLM: {type(llm_model).__name__}")
+    logger.info(f"  Agent: {type(voice_agent).__name__}")
+    logger.info(f"  Audio output: {type(session.output.audio).__name__}")
+
+    # Monitor agent state changes to control avatar behavior
+    @session.on("agent_state_changed")
+    def on_agent_state_changed(event):
+        logger.info(f"🔄 Agent state: {event.old_state} → {event.new_state}")
+
+        # Send state to avatar worker via data channel
+        try:
+            # Encode state as JSON
+            import json
+            state_msg = json.dumps({
+                "type": "agent_state",
+                "state": event.new_state,
+                "old_state": event.old_state,
+            })
+
+            # Send via data stream to avatar worker
+            ctx.room.local_participant.publish_data(
+                state_msg.encode('utf-8'),
+                destination_identities=[AVATAR_IDENTITY],
+                topic="agent_state"
+            )
+            logger.debug(f"📤 Sent state '{event.new_state}' to avatar")
+        except Exception as e:
+            logger.error(f"Failed to send state to avatar: {e}")
+
     await session.start(
         agent=voice_agent,
         room=ctx.room,
@@ -186,6 +216,15 @@ async def entrypoint(ctx: agents.JobContext):
         ),
     )
     logger.info("✅ Agent session started")
+
+    # Monitor for agent responses (for debugging)
+    @session.on("agent_speech")
+    def on_agent_speech(speech):
+        logger.info(f"🗣️  Agent speaking: {len(speech.audio) if hasattr(speech, 'audio') else 'N/A'} bytes")
+
+    @session.on("user_speech")
+    def on_user_speech(speech):
+        logger.info(f"👤 User spoke: {speech.text if hasattr(speech, 'text') else 'N/A'}")
 
     # Debug: Check what tracks are published by this agent
     await asyncio.sleep(1.0)  # Wait for any async publishing
