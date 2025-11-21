@@ -67,6 +67,7 @@ async def main(api_url: str, api_token: str):
         video_width=AVATAR_WIDTH,
         video_height=AVATAR_HEIGHT,
         video_fps=AVATAR_FPS,
+        # video_fps=60,
         audio_sample_rate=16000,  # Ditto expects 16kHz
         audio_channels=1,  # Mono
     )
@@ -128,6 +129,7 @@ async def main(api_url: str, api_token: str):
         audio_recv=DataStreamAudioReceiver(room),
         video_gen=video_gen,
         options=avatar_options,
+        _queue_size_ms=500,  # Larger queue for smoother handling of TTS bursts (default: 100ms)
     )
 
     try:

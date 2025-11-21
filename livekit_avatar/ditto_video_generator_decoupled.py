@@ -95,9 +95,8 @@ class DittoVideoGeneratorDecoupled(VideoGenerator):
         self._next_timestamp_to_yield_ms = 0
         self._first_chunk = True
 
-        # Flow control to prevent latency buildup and ensure smooth streaming
-        self.MAX_PAIRS_PER_BATCH = 5  # Small batches prevent flooding LiveKit buffer
-        self.MAX_PENDING_PAIRS = 25   # ~1 second max latency (25 fps)
+        # Flow control - let AVSynchronizer handle pacing and buffering
+        self.MAX_PENDING_PAIRS = 30    # ~1.2 second max latency (30 fps) - for diagnostics only
 
         # Events
         self._loop = asyncio.get_event_loop()
@@ -113,6 +112,7 @@ class DittoVideoGeneratorDecoupled(VideoGenerator):
         self._chunks_processed = 0
         self._frames_yielded = 0
         self._generation_start = None
+        self._last_pending_count = 0  # Track pending growth
 
         # Wait time diagnostics
         self._audio_queue_wait_times = []
@@ -354,45 +354,41 @@ class DittoVideoGeneratorDecoupled(VideoGenerator):
                 yield_total_time = 0
 
                 # Yield all consecutive complete pairs starting from cursor
+                # AVSynchronizer handles pacing and buffering, we just feed it continuously
                 inner_loop_iterations = 0
                 while True:
                     inner_loop_iterations += 1
                     ts = self._next_timestamp_to_yield_ms
                     pair = self._pending_pairs.get(ts)
 
-                    # Break if: (1) no pair, (2) incomplete pair, OR (3) batch limit reached
-                    if pair is None or not pair.is_complete() or pairs_in_batch >= self.MAX_PAIRS_PER_BATCH:
-                        # Clear event only if no more complete pairs
-                        if pair is None or not pair.is_complete():
-                            self._pair_ready_event.clear()
+                    # Break if: (1) no pair, OR (2) incomplete pair
+                    # No batch limit - yield continuously, AVSynchronizer handles pacing
+                    if pair is None or not pair.is_complete():
+                        # Clear event - no more complete pairs available
+                        self._pair_ready_event.clear()
 
                         # Log batch statistics (ALWAYS, to see the pattern)
                         batch_total_time = (time.time() - batch_total_start) * 1000
-                        reason = "incomplete" if (pair is None or not pair.is_complete()) else "batch_limit"
                         logger.info(
                             f"🔄 Batch {batch_count}: total={batch_total_time:.1f}ms "
                             f"(wait={wait_duration:.1f}ms, yield={yield_total_time:.1f}ms), "
                             f"pairs={pairs_in_batch}, inner_iters={inner_loop_iterations}, "
-                            f"next_ts={self._next_timestamp_to_yield_ms}ms, reason={reason}"
+                            f"next_ts={self._next_timestamp_to_yield_ms}ms"
                         )
                         break
 
-                    # Safety: Log if inner loop runs too long
-                    if inner_loop_iterations % 100 == 0:
-                        logger.warning(
-                            f"⚠️ Inner loop running continuously: {inner_loop_iterations} iterations, "
-                            f"pairs_yielded={pairs_in_batch}"
-                        )
+                    # Safety: Log if inner loop runs too long (commented out - expected with no batch limit)
+                    # if inner_loop_iterations % 100 == 0:
+                    #     logger.warning(
+                    #         f"⚠️ Inner loop running continuously: {inner_loop_iterations} iterations, "
+                    #         f"pairs_yielded={pairs_in_batch}"
+                    #     )
 
                     # Yield pair (audio first, then video - maintains lip sync!)
+                    # AVSynchronizer handles all pacing and network buffering
                     t_yield_start = time.time()
                     yield pair.audio
                     yield pair.video
-
-                    # CRITICAL: Yield control to event loop so LiveKit can send frames over network
-                    # Without this, we flood the buffer and cause stuttering
-                    await asyncio.sleep(0)
-
                     yield_duration = (time.time() - t_yield_start) * 1000
                     yield_total_time += yield_duration
 
@@ -402,9 +398,9 @@ class DittoVideoGeneratorDecoupled(VideoGenerator):
                     self._frames_yielded += 1
                     pairs_in_batch += 1
 
-                    # Log slow yields
-                    if yield_duration > 50:  # Slower than expected (40ms)
-                        logger.warning(f"⏱️ Slow yield: {yield_duration:.1f}ms at {ts}ms")
+                    # Log slow yields (commented out - too verbose)
+                    # if yield_duration > 50:  # Slower than expected (40ms)
+                    #     logger.warning(f"⏱️ Slow yield: {yield_duration:.1f}ms at {ts}ms")
 
                     # Diagnostics every second
                     if self._frames_yielded % 25 == 0:
@@ -418,24 +414,27 @@ class DittoVideoGeneratorDecoupled(VideoGenerator):
 
                         # Calculate latency (pending × 40ms)
                         latency_ms = len(self._pending_pairs) * 40
+                        pending_delta = len(self._pending_pairs) - self._last_pending_count
+                        self._last_pending_count = len(self._pending_pairs)
 
                         logger.info(
                             f"📊 {self._frames_yielded} frames in {elapsed:.2f}s "
-                            f"(drift: {drift:+.2f}s, pending: {len(self._pending_pairs)} "
-                            f"[{complete} complete, {incomplete} incomplete], "
+                            f"(drift: {drift:+.2f}s, pending: {len(self._pending_pairs)} ({pending_delta:+d}), "
+                            f"complete: {complete}, incomplete: {incomplete}, "
                             f"latency: {latency_ms}ms)"
                         )
 
-                        # Warn if latency too high
+                        # Warn if latency getting high
                         if len(self._pending_pairs) > self.MAX_PENDING_PAIRS:
                             logger.warning(
                                 f"⚠️ High latency! {len(self._pending_pairs)} pending pairs "
                                 f"({latency_ms}ms buffered) - target is {self.MAX_PENDING_PAIRS} pairs "
-                                f"({self.MAX_PENDING_PAIRS * 40}ms)"
+                                f"({self.MAX_PENDING_PAIRS * 40}ms). "
+                                f"AVSynchronizer queue will handle buffering."
                             )
 
-                        # Wait time statistics
-                        self._log_wait_statistics()
+                        # Wait time statistics (commented out - too verbose for debugging)
+                        # self._log_wait_statistics()
 
         except Exception as e:
             logger.error(f"Main loop error: {e}", exc_info=True)
