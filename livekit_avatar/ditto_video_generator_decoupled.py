@@ -98,6 +98,10 @@ class DittoVideoGeneratorDecoupled(VideoGenerator):
         # Flow control - let AVSynchronizer handle pacing and buffering
         self.MAX_PENDING_PAIRS = 30    # ~1.2 second max latency (30 fps) - for diagnostics only
 
+        # Idle generation tracking - for dynamic pacing
+        self._is_generating_idle = False
+        self._target_frame_time_ms = 1000.0 / options.video_fps  # 40ms for 25fps
+
         # Events
         self._loop = asyncio.get_event_loop()
         self._pair_ready_event = asyncio.Event()  # Signals complete pair available
@@ -203,8 +207,12 @@ class DittoVideoGeneratorDecoupled(VideoGenerator):
                     self._audio_queue_wait_times.append(queue_wait_ms)
 
                     if isinstance(frame, AudioSegmentEnd):
-                        logger.info("AudioSegmentEnd in audio task")
+                        logger.info("AudioSegmentEnd in audio task - switching to idle generation")
+                        self._is_generating_idle = True  # Back to idle after TTS ends
                         continue
+
+                    # Real TTS audio received
+                    self._is_generating_idle = False
 
                     # Resample
                     resampled = []
@@ -225,6 +233,7 @@ class DittoVideoGeneratorDecoupled(VideoGenerator):
                     self._audio_queue_wait_times.append(40.0)  # Full timeout
                     silent = self._create_silent_frame()
                     resampled = [silent]
+                    self._is_generating_idle = True  # Mark as idle generation
 
                 # Chunk and buffer - measure lock wait time
                 t_lock_start = time.time()
@@ -262,7 +271,6 @@ class DittoVideoGeneratorDecoupled(VideoGenerator):
             logger.error(f"Audio task error: {e}", exc_info=True)
         finally:
             logger.info("🛑 Audio task stopped")
-
     async def _chunk_processing_task(self):
         """Background: Process chunks continuously (DON'T wait for frames!)."""
         logger.info("🎨 Processing task started")
@@ -391,6 +399,14 @@ class DittoVideoGeneratorDecoupled(VideoGenerator):
                     yield pair.video
                     yield_duration = (time.time() - t_yield_start) * 1000
                     yield_total_time += yield_duration
+
+                    # Dynamic pacing for idle frames
+                    # Idle frames process in 5-10ms, so we add wait to reach target 40ms
+                    # TTS frames naturally take ~40ms, so they don't need extra wait
+                    if self._is_generating_idle:
+                        wait_time_ms = max(0, self._target_frame_time_ms - yield_duration)
+                        if wait_time_ms > 0:
+                            await asyncio.sleep(wait_time_ms / 1000.0)
 
                     # Cleanup
                     del self._pending_pairs[ts]
