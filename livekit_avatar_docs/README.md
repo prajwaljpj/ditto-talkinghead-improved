@@ -1,138 +1,170 @@
-# LiveKit Conversational Avatar Agent
+# LiveKit Avatar System Documentation
 
-A real-time conversational AI avatar powered by:
-- **LiveKit** - Real-time video/audio streaming
-- **Google Gemini** - Large Language Model for conversation
-- **Ditto** - Audio-driven avatar animation
+> Real-time AI-powered talking head avatar using Ditto TalkingHead and LiveKit
 
-## What This Does
+## Overview
 
-This agent creates a conversational AI avatar that:
-1. **Listens** to users speaking via WebRTC
-2. **Understands** speech using Gemini's real-time API
-3. **Responds** with natural language
-4. **Animates** a photorealistic avatar with lip-sync
+This documentation covers the complete LiveKit Avatar system - a real-time conversational AI avatar that combines:
 
-## Quick Start
+- **Google Gemini** for natural language understanding and speech synthesis
+- **Ditto TalkingHead** for photorealistic lip-synced video generation
+- **LiveKit** for real-time WebRTC communication
 
-### Prerequisites
+The system enables users to have natural conversations with an AI avatar that responds with synchronized audio and video in real-time.
 
-- Python 3.10+
-- CUDA-capable GPU (for Ditto avatar generation)
-- LiveKit server (local or cloud)
-- Google Cloud Platform account with Vertex AI enabled
+## Quick Links
 
-### 1. Environment Setup
+| Document | Description |
+|----------|-------------|
+| [Architecture](./ARCHITECTURE.md) | System design, data flow, and component interaction |
+| [Setup Guide](./SETUP_GUIDE.md) | Step-by-step installation and configuration |
+| [API Reference](./API_REFERENCE.md) | Detailed API documentation for all components |
+| [Troubleshooting](./TROUBLESHOOTING.md) | Common issues and solutions |
+| [Pipeline Deep Dive](./PIPELINE_DEEP_DIVE.md) | Internals of the StreamSDK pipeline |
 
-```bash
-# Set required environment variables
-export GOOGLE_APPLICATION_CREDENTIALS="/path/to/service-account.json"
-export VERTEX_PROJECT_ID="your-gcp-project-id"
-export VERTEX_LOCATION="us-central1"
-
-# Optional: Custom avatar settings
-export SOURCE_PATH="avatars/your_avatar_image.jpg"
-export AVATAR_WIDTH="1280"
-export AVATAR_HEIGHT="720"
-```
-
-### 2. Start LiveKit Server
-
-If running locally:
-```bash
-# LiveKit will use default dev credentials
-docker run --rm -p 7880:7880 -p 7881:7881 -p 7882:7882/udp \
-  livekit/livekit-server --dev
-```
-
-### 3. Start the Avatar Agent
-
-```bash
-# Make the script executable
-chmod +x livekit_server.sh
-
-# Run the agent
-./livekit_server.sh
-```
-
-### 4. Start the Token Server (for client access)
-
-```bash
-cd livekit_client
-python token_server.py
-```
-
-### 5. Open the Client
-
-Navigate to: `http://localhost:8000/simple_client.html`
-
-## Project Structure
+## System Architecture at a Glance
 
 ```
-ditto-talkinghead/
-├── livekit_avatar/              # Avatar agent implementation
-│   ├── main_agent.py           # Main LiveKit agent entrypoint
-│   ├── custom_avatar_worker.py # Avatar generation worker
-│   └── __init__.py
-├── livekit_client/              # Web client
-│   ├── simple_client.html      # Browser-based client
-│   └── token_server.py         # Token generation server
-├── livekit_avatar_docs/         # Documentation (this folder)
-├── stream_pipeline_online.py    # Ditto avatar SDK wrapper
-├── livekit_server.sh            # Server startup script
-└── checkpoints/                 # Ditto model weights
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                              LiveKit Server                                  │
+│                            (WebRTC Signaling)                               │
+└─────────────────────────────────────────────────────────────────────────────┘
+        │                           │                           │
+        │ WebRTC                    │ DataStream               │ WebRTC
+        │                           │ (audio)                   │
+        ▼                           ▼                           ▼
+┌───────────────┐           ┌───────────────┐           ┌───────────────┐
+│    Client     │           │  Agent Worker │           │ Avatar Worker │
+│  (Browser)    │◀──────────│   (Gemini)    │──────────▶│   (Ditto)     │
+│               │   audio   │               │   TTS     │               │
+│ • Captures    │   +video  │ • STT/LLM/TTS │   audio   │ • Video Gen   │
+│   user audio  │           │ • Conversation│           │ • Lip Sync    │
+│ • Displays    │           │   management  │           │ • Publishes   │
+│   avatar      │           │               │           │   audio+video │
+└───────────────┘           └───────────────┘           └───────────────┘
 ```
 
 ## Key Features
 
-### Real-Time Streaming
-- Sub-second latency for natural conversations
-- Adaptive bitrate for varying network conditions
-- WebRTC-based peer-to-peer communication
+### 🎭 Photorealistic Avatar
+- High-quality lip-synced video generation using Ditto TalkingHead
+- Support for custom avatar images (any portrait photo)
+- Configurable resolution (up to 1920x1080)
+- Real-time 25fps video output
 
-### Lip-Sync Animation
-- Audio-driven facial animation using Ditto model
-- 50 FPS video output for smooth motion
-- HD video quality (1280x720 default)
+### 🗣️ Natural Conversation
+- Powered by Google Gemini's native audio model
+- Real-time speech-to-text and text-to-speech
+- Natural conversation flow with interruption handling
+- Configurable voice and personality
 
-### Conversation Management
-- Voice Activity Detection (VAD)
-- Turn-taking between user and agent
-- Context-aware responses from Gemini
+### ⚡ Low Latency Architecture
+- Decoupled two-worker design for optimal performance
+- Streaming audio processing with chunked inference
+- Parallel pipeline stages for maximum throughput
+- WebRTC for minimal network latency
 
-### State Management
-- **Idle**: Subtle breathing/blinking animations
-- **Listening**: Active listening pose when user speaks
-- **Thinking**: Contemplative expression during processing
-- **Speaking**: Synchronized lip movements with TTS
+### 🔧 Flexible Deployment
+- Local development with LiveKit's dev server
+- Production-ready with LiveKit Cloud
+- GPU-accelerated inference (TensorRT optimized)
+- Docker-friendly architecture
 
-## Documentation
+## Prerequisites
 
-- [Architecture Overview](ARCHITECTURE.md) - System design and data flow
-- [Setup Guide](SETUP_GUIDE.md) - Detailed installation instructions
-- [API Reference](API_REFERENCE.md) - Code API documentation
-- [Troubleshooting](TROUBLESHOOTING.md) - Common issues and solutions
+Before setting up the system, ensure you have:
 
-## Requirements
+- **Hardware**: NVIDIA GPU with 8GB+ VRAM (RTX 3070+ recommended)
+- **Software**:
+  - Python 3.10+
+  - CUDA 12.x
+  - TensorRT 10.x
+  - Node.js 18+ (for client development)
+- **Services**:
+  - Google Cloud account with Vertex AI enabled
+  - LiveKit server (local or cloud)
 
-### Hardware
-- NVIDIA GPU with CUDA support (RTX 3000+ recommended)
-- 8GB+ GPU VRAM
-- 16GB+ system RAM
+## Quick Start
 
-### Software
-- Python 3.10+
-- CUDA 11.8+ / TensorRT 8.6+
-- FFmpeg (for video encoding)
-- Modern web browser with WebRTC support
+### 1. Install Dependencies
+
+```bash
+# Clone and setup
+cd ditto-talkinghead
+./setup_uv.sh
+
+# Activate environment
+source .venv/bin/activate
+```
+
+### 2. Configure Credentials
+
+```bash
+# Google Cloud (for Gemini)
+export GOOGLE_APPLICATION_CREDENTIALS="/path/to/service-account.json"
+export VERTEX_PROJECT_ID="your-project-id"
+export VERTEX_LOCATION="us-central1"
+
+# LiveKit credentials are set automatically by livekit_server.sh
+```
+
+### 3. Start the System (3 Terminals)
+
+```bash
+# Terminal 1: Start LiveKit server (Docker)
+sudo docker run --rm \
+    -p 7880:7880 \
+    -p 7881:7881 \
+    -p 7882:7882/udp \
+    -e LIVEKIT_KEYS="devkey: devsecret" \
+    livekit/livekit-server:latest
+
+# Terminal 2: Start the agent (auto-launches avatar worker)
+./livekit_server.sh
+
+# Terminal 3: Start token server (for client)
+uv run python livekit_client/token_server.py
+```
+
+### 4. Connect Client
+
+Open `http://localhost:8000/simple_client.html` in your browser and click "Connect".
+
+## Directory Structure
+
+```
+livekit_avatar/
+├── __init__.py                      # Package init
+├── agent_worker.py                  # Main agent (Gemini conversation)
+├── avatar_worker.py                 # Avatar subprocess (video generation)
+└── ditto_video_generator_decoupled.py  # LiveKit VideoGenerator implementation
+
+livekit_client/
+├── simple_client.html               # Browser test client
+└── token_server.py                  # Development token server
+
+stream_pipeline_online.py            # Core Ditto streaming SDK
+```
+
+## Performance Characteristics
+
+| Metric | Value |
+|--------|-------|
+| Video Resolution | 1280x720 (configurable) |
+| Frame Rate | 25 fps |
+| Audio Sample Rate | 16 kHz |
+| Chunk Processing Time | ~80-100ms |
+| End-to-End Latency | ~200-400ms |
+| GPU Memory Usage | ~4-6 GB |
+
+## Next Steps
+
+1. Read the [Architecture](./ARCHITECTURE.md) document to understand the system design
+2. Follow the [Setup Guide](./SETUP_GUIDE.md) for detailed installation instructions
+3. Review the [API Reference](./API_REFERENCE.md) for customization options
+4. Check [Troubleshooting](./TROUBLESHOOTING.md) if you encounter issues
 
 ## License
 
-See project root for license information.
+This project uses the Ditto TalkingHead model. Please review the checkpoint license at `checkpoints/LICENSE` before deployment.
 
-## Support
-
-For issues and questions:
-- Check [Troubleshooting Guide](TROUBLESHOOTING.md)
-- Review LiveKit documentation: https://docs.livekit.io
-- Review Ditto documentation in the project root

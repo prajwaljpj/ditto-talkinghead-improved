@@ -7,8 +7,6 @@ import cv2
 import time
 from typing import Optional, Union
 from collections.abc import AsyncGenerator, AsyncIterator
-from dataclasses import dataclass
-
 from livekit import rtc
 from livekit.agents import utils
 from livekit.agents.voice.avatar import (
@@ -37,22 +35,6 @@ def rgb_to_i420(frame_rgb: np.ndarray, width: int, height: int) -> bytes:
     frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
     yuv_frame = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2YUV_I420)
     return yuv_frame.tobytes()
-
-
-@dataclass
-class TimestampedPair:
-    """Audio-video pair with timestamp."""
-    timestamp_ms: int
-    audio: Optional[rtc.AudioFrame] = None
-    video: Optional[rtc.VideoFrame] = None
-
-    def is_complete(self) -> bool:
-        return self.audio is not None and self.video is not None
-
-    def __repr__(self) -> str:
-        a = "✓" if self.audio else "✗"
-        v = "✓" if self.video else "✗"
-        return f"Pair({self.timestamp_ms}ms: a={a}, v={v})"
 
 
 class DittoVideoGeneratorDecoupled(VideoGenerator):
@@ -89,14 +71,14 @@ class DittoVideoGeneratorDecoupled(VideoGenerator):
             samples_per_channel=samples_per_frame,
         )
 
-        # Timestamp matching
-        self._pending_pairs = {}
-        self._current_audio_timestamp_ms = 0
-        self._next_timestamp_to_yield_ms = 0
+        # Frame pairing - use separate queues, pair by order (not timestamp)
+        self._audio_queue_internal = []  # Audio frames waiting for video
+        self._video_queue_internal = []  # Video frames waiting for audio
+        self._paired_frames = []  # Complete (audio, video) pairs ready to yield
         self._first_chunk = True
 
-        # Flow control - let AVSynchronizer handle pacing and buffering
-        self.MAX_PENDING_PAIRS = 30    # ~1.2 second max latency (30 fps) - for diagnostics only
+        # Flow control - diagnostics only
+        self.MAX_QUEUE_SIZE = 30  # For diagnostics warnings
 
         # Idle generation tracking - for dynamic pacing
         self._is_generating_idle = False
@@ -116,7 +98,6 @@ class DittoVideoGeneratorDecoupled(VideoGenerator):
         self._chunks_processed = 0
         self._frames_yielded = 0
         self._generation_start = None
-        self._last_pending_count = 0  # Track pending growth
 
         # Wait time diagnostics
         self._audio_queue_wait_times = []
@@ -143,18 +124,19 @@ class DittoVideoGeneratorDecoupled(VideoGenerator):
                    f"overlap={self.sdk.audio2motion.overlap_v2}, "
                    f"valid_len={self.sdk.audio2motion.valid_clip_len}")
 
-        # Warmup
+        # Warmup - produces frames that we discard
         logger.info("Warming up...")
         for i in range(3):
             self.sdk.run_chunk(self.silent_chunk, self.chunksize)
-        self._pending_pairs.clear()
+        # Clear any frames produced during warmup
+        self._video_queue_internal.clear()
+        self._audio_queue_internal.clear()
+        self._paired_frames.clear()
         logger.info("✅ Ready")
 
     def _handle_frame(self, frame_rgb: np.ndarray, frame_idx: int, timestamp: float):
-        """Video frame callback from Ditto."""
+        """Video frame callback from Ditto. Pairs with audio by order."""
         try:
-            timestamp_ms = round(timestamp * 1000)
-
             i420 = rgb_to_i420(frame_rgb, self._options.video_width, self._options.video_height)
             video = rtc.VideoFrame(
                 data=i420,
@@ -163,19 +145,22 @@ class DittoVideoGeneratorDecoupled(VideoGenerator):
                 type=rtc.VideoBufferType.I420,
             )
 
-            # Store video
-            if timestamp_ms not in self._pending_pairs:
-                self._pending_pairs[timestamp_ms] = TimestampedPair(timestamp_ms)
-            self._pending_pairs[timestamp_ms].video = video
+            # Add video to queue
+            self._video_queue_internal.append(video)
 
-            # Signal if pair is complete
-            pair = self._pending_pairs[timestamp_ms]
-            if pair.is_complete():
-                self._loop.call_soon_threadsafe(self._pair_ready_event.set)
-                logger.debug(f"✅ Complete pair at {timestamp_ms}ms")
+            # Try to pair with waiting audio
+            self._try_pair_frames()
 
         except Exception as e:
             logger.error(f"Frame callback error: {e}", exc_info=True)
+
+    def _try_pair_frames(self):
+        """Pair audio and video frames by order (FIFO)."""
+        while self._audio_queue_internal and self._video_queue_internal:
+            audio = self._audio_queue_internal.pop(0)
+            video = self._video_queue_internal.pop(0)
+            self._paired_frames.append((audio, video))
+            self._loop.call_soon_threadsafe(self._pair_ready_event.set)
 
     async def push_audio(self, frame: rtc.AudioFrame | AudioSegmentEnd) -> None:
         await self._audio_queue.put(frame)
@@ -251,17 +236,9 @@ class DittoVideoGeneratorDecoupled(VideoGenerator):
                                 self._sdk_audio_buffer, data_float
                             ])
 
-                            # Create audio pair
-                            ts = self._current_audio_timestamp_ms
-                            if ts not in self._pending_pairs:
-                                self._pending_pairs[ts] = TimestampedPair(ts)
-                            self._pending_pairs[ts].audio = synced
-
-                            # Signal if complete
-                            if self._pending_pairs[ts].is_complete():
-                                self._pair_ready_event.set()
-
-                            self._current_audio_timestamp_ms += 40
+                            # Add audio to queue, pair with video by order
+                            self._audio_queue_internal.append(synced)
+                            self._try_pair_frames()
 
                     # Signal if buffer ready
                     if len(self._sdk_audio_buffer) >= self.split_len:
@@ -350,7 +327,7 @@ class DittoVideoGeneratorDecoupled(VideoGenerator):
             batch_count = 0
 
             while True:
-                # Wait for a complete pair to be available
+                # Wait for paired frames to be available
                 batch_total_start = time.time()
                 wait_start = time.time()
                 await self._pair_ready_event.wait()
@@ -361,62 +338,25 @@ class DittoVideoGeneratorDecoupled(VideoGenerator):
                 pairs_in_batch = 0
                 yield_total_time = 0
 
-                # Yield all consecutive complete pairs starting from cursor
-                # AVSynchronizer handles pacing and buffering, we just feed it continuously
-                inner_loop_iterations = 0
-                while True:
-                    inner_loop_iterations += 1
-                    ts = self._next_timestamp_to_yield_ms
-                    pair = self._pending_pairs.get(ts)
-
-                    # Break if: (1) no pair, OR (2) incomplete pair
-                    # No batch limit - yield continuously, AVSynchronizer handles pacing
-                    if pair is None or not pair.is_complete():
-                        # Clear event - no more complete pairs available
-                        self._pair_ready_event.clear()
-
-                        # Log batch statistics (ALWAYS, to see the pattern)
-                        batch_total_time = (time.time() - batch_total_start) * 1000
-                        logger.info(
-                            f"🔄 Batch {batch_count}: total={batch_total_time:.1f}ms "
-                            f"(wait={wait_duration:.1f}ms, yield={yield_total_time:.1f}ms), "
-                            f"pairs={pairs_in_batch}, inner_iters={inner_loop_iterations}, "
-                            f"next_ts={self._next_timestamp_to_yield_ms}ms"
-                        )
-                        break
-
-                    # Safety: Log if inner loop runs too long (commented out - expected with no batch limit)
-                    # if inner_loop_iterations % 100 == 0:
-                    #     logger.warning(
-                    #         f"⚠️ Inner loop running continuously: {inner_loop_iterations} iterations, "
-                    #         f"pairs_yielded={pairs_in_batch}"
-                    #     )
+                # Yield all available paired frames
+                while self._paired_frames:
+                    audio, video = self._paired_frames.pop(0)
 
                     # Yield pair (audio first, then video - maintains lip sync!)
-                    # AVSynchronizer handles all pacing and network buffering
                     t_yield_start = time.time()
-                    yield pair.audio
-                    yield pair.video
+                    yield audio
+                    yield video
                     yield_duration = (time.time() - t_yield_start) * 1000
                     yield_total_time += yield_duration
 
                     # Dynamic pacing for idle frames
-                    # Idle frames process in 5-10ms, so we add wait to reach target 40ms
-                    # TTS frames naturally take ~40ms, so they don't need extra wait
                     if self._is_generating_idle:
                         wait_time_ms = max(0, self._target_frame_time_ms - yield_duration)
                         if wait_time_ms > 0:
                             await asyncio.sleep(wait_time_ms / 1000.0)
 
-                    # Cleanup
-                    del self._pending_pairs[ts]
-                    self._next_timestamp_to_yield_ms += 40
                     self._frames_yielded += 1
                     pairs_in_batch += 1
-
-                    # Log slow yields (commented out - too verbose)
-                    # if yield_duration > 50:  # Slower than expected (40ms)
-                    #     logger.warning(f"⏱️ Slow yield: {yield_duration:.1f}ms at {ts}ms")
 
                     # Diagnostics every second
                     if self._frames_yielded % 25 == 0:
@@ -424,33 +364,26 @@ class DittoVideoGeneratorDecoupled(VideoGenerator):
                         expected = self._frames_yielded / 25.0
                         drift = elapsed - expected
 
-                        # Count complete vs incomplete pairs
-                        complete = sum(1 for p in self._pending_pairs.values() if p.is_complete())
-                        incomplete = len(self._pending_pairs) - complete
-
-                        # Calculate latency (pending × 40ms)
-                        latency_ms = len(self._pending_pairs) * 40
-                        pending_delta = len(self._pending_pairs) - self._last_pending_count
-                        self._last_pending_count = len(self._pending_pairs)
+                        # Queue lengths show sync status
+                        audio_waiting = len(self._audio_queue_internal)
+                        video_waiting = len(self._video_queue_internal)
 
                         logger.info(
                             f"📊 {self._frames_yielded} frames in {elapsed:.2f}s "
-                            f"(drift: {drift:+.2f}s, pending: {len(self._pending_pairs)} ({pending_delta:+d}), "
-                            f"complete: {complete}, incomplete: {incomplete}, "
-                            f"latency: {latency_ms}ms)"
+                            f"(drift: {drift:+.2f}s, audio_q: {audio_waiting}, video_q: {video_waiting}, "
+                            f"paired: {len(self._paired_frames)})"
                         )
 
-                        # Warn if latency getting high
-                        if len(self._pending_pairs) > self.MAX_PENDING_PAIRS:
-                            logger.warning(
-                                f"⚠️ High latency! {len(self._pending_pairs)} pending pairs "
-                                f"({latency_ms}ms buffered) - target is {self.MAX_PENDING_PAIRS} pairs "
-                                f"({self.MAX_PENDING_PAIRS * 40}ms). "
-                                f"AVSynchronizer queue will handle buffering."
-                            )
+                # Clear event - no more paired frames
+                self._pair_ready_event.clear()
 
-                        # Wait time statistics (commented out - too verbose for debugging)
-                        # self._log_wait_statistics()
+                # Log batch statistics
+                batch_total_time = (time.time() - batch_total_start) * 1000
+                logger.debug(
+                    f"🔄 Batch {batch_count}: total={batch_total_time:.1f}ms "
+                    f"(wait={wait_duration:.1f}ms, yield={yield_total_time:.1f}ms), "
+                    f"pairs={pairs_in_batch}"
+                )
 
         except Exception as e:
             logger.error(f"Main loop error: {e}", exc_info=True)

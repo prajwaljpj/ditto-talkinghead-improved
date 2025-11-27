@@ -1,389 +1,443 @@
 # Setup Guide
 
-Complete step-by-step instructions for setting up the LiveKit Avatar Agent.
+This guide walks you through setting up the complete LiveKit Avatar system from scratch.
+
+## Table of Contents
+
+1. [Prerequisites](#prerequisites)
+2. [Environment Setup](#environment-setup)
+3. [Model Checkpoints](#model-checkpoints)
+4. [LiveKit Configuration](#livekit-configuration)
+5. [Google Cloud Setup](#google-cloud-setup)
+6. [Running the System](#running-the-system)
+7. [Testing the Setup](#testing-the-setup)
+8. [Production Deployment](#production-deployment)
+
+---
 
 ## Prerequisites
 
 ### Hardware Requirements
 
-- **GPU**: NVIDIA GPU with CUDA support (RTX 3060 or better recommended)
-- **VRAM**: Minimum 6GB, 8GB+ recommended
-- **RAM**: 16GB system memory minimum
-- **CPU**: Multi-core processor (4+ cores recommended)
+| Component | Minimum | Recommended |
+|-----------|---------|-------------|
+| GPU | NVIDIA RTX 3060 (8GB) | NVIDIA RTX 4080+ (16GB) |
+| VRAM | 6 GB | 12+ GB |
+| RAM | 16 GB | 32 GB |
+| CPU | 8 cores | 12+ cores |
+| Storage | 20 GB | 50 GB (for models) |
 
 ### Software Requirements
 
-- **Operating System**: Linux (Ubuntu 20.04+ recommended) or Windows with WSL2
-- **Python**: 3.10 or 3.11 (3.12 may have compatibility issues)
-- **CUDA**: 11.8 or newer
-- **TensorRT**: 8.6+ (should match Ditto requirements)
-- **Docker**: For running LiveKit server locally (optional)
-
-## Step 1: Clone and Setup Project
-
 ```bash
-# Navigate to your project directory
-cd /path/to/ditto-talkinghead
+# Check CUDA version (need 12.x)
+nvcc --version
 
-# Install uv (if not already installed)
-curl -LsSf https://astral.sh/uv/install.sh | sh
+# Check TensorRT (need 10.x)
+python -c "import tensorrt; print(tensorrt.__version__)"
 
-# Sync dependencies
-uv sync
+# Check Python version (need 3.10+)
+python --version
 ```
 
-## Step 2: Verify Ditto Models
+### Required Software
 
-Ensure your Ditto checkpoint files are in place:
+- **Operating System**: Ubuntu 20.04/22.04 or Windows 11 with WSL2
+- **Python**: 3.10 or 3.11
+- **CUDA**: 12.0 or higher
+- **TensorRT**: 10.x (installed via the setup scripts)
+- **Node.js**: 18+ (optional, for client development)
+
+---
+
+## Environment Setup
+
+### Option 1: Using UV (Recommended)
 
 ```bash
-# Check for required files
-ls checkpoints/ditto_trt_custom2/
-# Should contain: TensorRT engine files, feature extractors, etc.
+# Navigate to project
+cd ditto-talkinghead
 
-ls checkpoints/ditto_cfg/
-# Should contain: v0.4_hubert_cfg_trt_online.pkl or similar
+# Run setup script
+./setup_uv.sh
+
+# Activate environment
+source .venv/bin/activate
 ```
 
-If missing, follow the Ditto setup instructions in the main project README.
-
-## Step 3: Google Cloud Platform Setup
-
-### 3.1 Create GCP Project
-
-1. Go to [Google Cloud Console](https://console.cloud.google.com)
-2. Create a new project or select an existing one
-3. Note your Project ID (e.g., `my-avatar-project-123`)
-
-### 3.2 Enable Required APIs
+### Option 2: Using Conda
 
 ```bash
-# Enable Vertex AI API
-gcloud services enable aiplatform.googleapis.com --project=YOUR_PROJECT_ID
+# Create environment
+conda env create -f environment.yaml
+
+# Activate
+conda activate ditto
+
+# Install additional dependencies
+pip install livekit livekit-agents livekit-plugins-google
 ```
 
-Or via the console:
-- Navigate to "APIs & Services" → "Library"
-- Search for "Vertex AI API"
-- Click "Enable"
-
-### 3.3 Create Service Account
+### Verify Installation
 
 ```bash
-# Create service account
-gcloud iam service-accounts create avatar-agent \
-    --display-name="Avatar Agent Service Account" \
-    --project=YOUR_PROJECT_ID
+# Run verification script
+python verify_installation.py
 
-# Grant necessary permissions
-gcloud projects add-iam-policy-binding YOUR_PROJECT_ID \
-    --member="serviceAccount:avatar-agent@YOUR_PROJECT_ID.iam.gserviceaccount.com" \
-    --role="roles/aiplatform.user"
-
-# Create and download key
-gcloud iam service-accounts keys create ~/avatar-service-account.json \
-    --iam-account=avatar-agent@YOUR_PROJECT_ID.iam.gserviceaccount.com
+# Expected output:
+# ✅ CUDA available
+# ✅ TensorRT available
+# ✅ Ditto components loaded
+# ✅ LiveKit SDK available
 ```
 
-### 3.4 Set Environment Variables
+---
+
+## Model Checkpoints
+
+### Download Checkpoints
+
+The Ditto model requires several checkpoint files. Download and organize them as follows:
 
 ```bash
-# Add to your ~/.bashrc or ~/.zshrc
-export GOOGLE_APPLICATION_CREDENTIALS="$HOME/avatar-service-account.json"
-export VERTEX_PROJECT_ID="YOUR_PROJECT_ID"
-export VERTEX_LOCATION="us-central1"  # or your preferred region
-
-# Reload your shell
-source ~/.bashrc
+checkpoints/
+├── ditto_cfg/
+│   ├── v0.4_hubert_cfg_trt.pkl         # TensorRT config
+│   └── v0.4_hubert_cfg_trt_online.pkl  # Online streaming config
+├── ditto_trt_Ampere_Plus/              # TensorRT engines (RTX 30xx+)
+│   ├── appearance_extractor.trt
+│   ├── motion_extractor.trt
+│   ├── warping_spade.trt
+│   ├── decoder.trt
+│   ├── lmdm.trt
+│   └── hubert.trt
+├── ditto_trt_custom/                   # Custom TRT engines (optional)
+├── LICENSE
+└── README.md
 ```
 
-## Step 4: LiveKit Server Setup
+### Build Custom TensorRT Engines (If Needed)
 
-You have two options: local development server or cloud deployment.
-
-### Option A: Local Development Server
+If you're using a different GPU architecture:
 
 ```bash
-# Pull and run LiveKit server (dev mode)
-docker run --rm \
-    --name livekit-server \
+# Convert ONNX to TensorRT
+python scripts/cvt_onnx_to_trt.py \
+    --onnx_dir checkpoints/ditto_onnx \
+    --trt_dir checkpoints/ditto_trt_custom
+```
+
+### Configure Checkpoint Paths
+
+Set the appropriate paths in your environment:
+
+```bash
+# For RTX 30xx/40xx (Ampere+)
+export DATA_ROOT="checkpoints/ditto_trt_Ampere_Plus"
+export CFG_PKL="checkpoints/ditto_cfg/v0.4_hubert_cfg_trt_online.pkl"
+
+# For custom builds
+export DATA_ROOT="checkpoints/ditto_trt_custom"
+export CFG_PKL="checkpoints/ditto_cfg/v0.4_hubert_cfg_trt.pkl"
+```
+
+---
+
+## LiveKit Configuration
+
+### Option 1: Local Development Server (Docker - Recommended)
+
+The easiest way to get started is with LiveKit's Docker image:
+
+```bash
+# Start LiveKit server using Docker
+sudo docker run --rm \
     -p 7880:7880 \
     -p 7881:7881 \
     -p 7882:7882/udp \
-    livekit/livekit-server \
-    --dev
+    -e LIVEKIT_KEYS="devkey: devsecret" \
+    livekit/livekit-server:latest
 
-# Server will use default dev credentials:
+# Default credentials:
+# URL: ws://localhost:7880
 # API Key: devkey
 # API Secret: devsecret
-# WebSocket URL: ws://localhost:7880
 ```
 
-### Option B: Cloud Deployment
+**Ports:**
+- `7880`: WebSocket signaling (HTTP/WS)
+- `7881`: RTC (TCP)
+- `7882`: RTC (UDP)
 
-For production, use [LiveKit Cloud](https://cloud.livekit.io) or self-host:
+### Option 1b: Local Development Server (Native Binary)
 
-1. Sign up at LiveKit Cloud
+Alternatively, use LiveKit's native binary:
+
+```bash
+# Install LiveKit CLI
+curl -sSL https://get.livekit.io/cli | bash
+
+# Start development server
+livekit-server --dev
+```
+
+### Option 2: LiveKit Cloud
+
+For production, use [LiveKit Cloud](https://cloud.livekit.io):
+
+1. Create an account at https://cloud.livekit.io
 2. Create a new project
-3. Note your:
-   - WebSocket URL (e.g., `wss://your-project.livekit.cloud`)
-   - API Key
-   - API Secret
+3. Copy your credentials:
 
-Update environment variables:
 ```bash
 export LIVEKIT_URL="wss://your-project.livekit.cloud"
 export LIVEKIT_API_KEY="your-api-key"
 export LIVEKIT_API_SECRET="your-api-secret"
 ```
 
-## Step 5: Configure Avatar Settings
+### Option 3: Self-Hosted Server
 
-### 5.1 Prepare Avatar Source
+For production self-hosting, see [LiveKit Deployment Guide](https://docs.livekit.io/deploying/).
 
-Choose or create an avatar source image:
-- **Format**: JPG or PNG
-- **Resolution**: 512x512 or higher
-- **Content**: Clear frontal face photo
-- **Recommended**: Professional headshot with neutral expression
+---
+
+## Google Cloud Setup
+
+### Create Service Account
+
+1. Go to [Google Cloud Console](https://console.cloud.google.com)
+2. Create a new project or select existing
+3. Enable the **Vertex AI API**
+4. Create a service account:
+   - Go to IAM & Admin → Service Accounts
+   - Create service account
+   - Grant role: `Vertex AI User`
+   - Create JSON key and download
+
+### Configure Credentials
 
 ```bash
-# Create avatars directory (if not exists)
-mkdir -p avatars
+# Set credentials file path
+export GOOGLE_APPLICATION_CREDENTIALS="/path/to/service-account.json"
 
-# Copy your avatar image
-cp /path/to/your/image.jpg avatars/my_avatar.jpg
+# Set project configuration
+export VERTEX_PROJECT_ID="your-gcp-project-id"
+export VERTEX_LOCATION="us-central1"  # or your preferred region
+
+# Set model (default is latest Gemini Live)
+export GEMINI_MODEL="gemini-live-2.5-flash-preview-native-audio-09-2025"
 ```
 
-### 5.2 Set Avatar Configuration
+### Verify Google Cloud Setup
 
 ```bash
-# Add to environment variables
-export SOURCE_PATH="avatars/my_avatar.jpg"
-export AVATAR_WIDTH="1280"
-export AVATAR_HEIGHT="720"
+# Test authentication
+gcloud auth application-default print-access-token
 
-# Optional: Adjust Ditto paths if using custom models
-export DATA_ROOT="checkpoints/ditto_trt_custom2/"
-export CFG_PKL="checkpoints/ditto_cfg/v0.4_hubert_cfg_trt_online.pkl"
+# Test Vertex AI access
+python -c "
+from google.cloud import aiplatform
+aiplatform.init(project='$VERTEX_PROJECT_ID', location='$VERTEX_LOCATION')
+print('✅ Vertex AI connection successful')
+"
 ```
 
-## Step 6: Install Additional Dependencies
+---
 
-The main dependencies should be installed via `uv sync`, but verify:
+## Running the System
+
+### Quick Start (3 Terminals)
+
+You need three terminal windows to run the complete system:
+
+#### Terminal 1: LiveKit Server (Docker)
 
 ```bash
-# Check for scipy (needed for audio resampling)
-uv run python -c "import scipy.signal"
-
-# Check for google-genai
-uv run python -c "import google.genai"
-
-# If missing, add them
-uv add scipy google-genai
+sudo docker run --rm \
+    -p 7880:7880 \
+    -p 7881:7881 \
+    -p 7882:7882/udp \
+    -e LIVEKIT_KEYS="devkey: devsecret" \
+    livekit/livekit-server:latest
 ```
 
-## Step 7: Test Ditto Model
-
-Before running the full agent, test that Ditto works:
+#### Terminal 2: Agent & Avatar Workers
 
 ```bash
-# Run a simple Ditto test (if you have a test script)
-uv run python test_ditto_inference.py
-
-# Should generate a test video without errors
-```
-
-## Step 8: Update Startup Script
-
-The `livekit_server.sh` script should already be configured, but verify:
-
-```bash
-# Check the script
-cat livekit_server.sh
-
-# Ensure it has:
-# - GOOGLE_APPLICATION_CREDENTIALS check
-# - Correct environment variable exports
-# - Correct paths to your config files
-```
-
-## Step 9: Start the Agent
-
-```bash
-# Make script executable
-chmod +x livekit_server.sh
-
-# Start the agent
 ./livekit_server.sh
-
-# You should see:
-# ✅ Published video track: 1280x720
-# ✅ Avatar worker started (idle mode)
-# ✅ Agent session started
 ```
 
-### Troubleshooting Agent Startup
+This script:
+1. Validates Google Cloud credentials
+2. Sets all environment variables (LiveKit, Vertex AI, Ditto)
+3. Checks and installs missing dependencies
+4. Starts the agent worker (which auto-launches avatar worker as subprocess)
 
-**Error: "GOOGLE_APPLICATION_CREDENTIALS must be set"**
-- Verify the environment variable is set: `echo $GOOGLE_APPLICATION_CREDENTIALS`
-- Ensure the file exists: `ls -l $GOOGLE_APPLICATION_CREDENTIALS`
-
-**Error: "No module named 'stream_pipeline_online'"**
-- Verify you're running from the project root directory
-- Check that `stream_pipeline_online.py` exists in the current directory
-
-**Error: "CUDA out of memory"**
-- Reduce avatar resolution: `export AVATAR_WIDTH=640 AVATAR_HEIGHT=360`
-- Close other GPU-intensive applications
-- Check GPU memory: `nvidia-smi`
-
-## Step 10: Start the Token Server
-
-In a new terminal:
+#### Terminal 3: Token Server (for web client)
 
 ```bash
-cd livekit_client
-uv run python token_server.py
+uv run python livekit_client/token_server.py
 
-# You should see:
+# Output:
 # 🚀 Token server running on http://localhost:8000
 # 🎫 Token endpoint: http://localhost:8000/token
 # 🌐 Client page: http://localhost:8000/simple_client.html
 ```
 
-## Step 11: Test the Client
+### Manual Start (For Development)
 
-1. Open a web browser
-2. Navigate to: `http://localhost:8000/simple_client.html`
-3. Enter your name (e.g., "Test User")
-4. Click "Connect"
-5. Allow microphone access when prompted
-6. You should see:
-   - Status: "Connected - Viewing avatar_video"
-   - Avatar video playing
-   - The agent greeting you
+If you want more control over each component:
 
-### Troubleshooting Client Connection
-
-**"Token server not responding"**
-- Verify token server is running: `curl http://localhost:8000/token`
-- Check firewall settings
-
-**"Failed to connect to LiveKit"**
-- Verify LiveKit server is running: `docker ps | grep livekit`
-- Check WebSocket URL in `simple_client.html` matches your server
-
-**"No video appearing"**
-- Open browser console (F12) and check for errors
-- Verify agent is publishing tracks (check agent logs)
-- Try refreshing the page
-
-**"No audio from agent"**
-- Check browser console for autoplay restrictions
-- Click on the page to enable audio playback
-- Verify volume is not muted
-
-## Step 12: Verify End-to-End Flow
-
-1. **Speak into your microphone**: "Hello, can you hear me?"
-2. **Observe agent logs**: Should show "User started speaking"
-3. **Wait for response**: Agent should reply verbally
-4. **Check avatar animation**: Lips should move in sync with speech
-
-## Advanced Configuration
-
-### Custom Gemini Instructions
-
-Edit `livekit_avatar/main_agent.py`:
-
-```python
-llm_model = google.beta.realtime.RealtimeModel(
-    # ... other params ...
-    instructions=(
-        "You are a helpful customer service agent. "
-        "Always be polite and professional. "
-        "Keep responses under 30 seconds."
-    ),
-)
-```
-
-### Adjust Video Quality
+#### Terminal 1: LiveKit Server
 
 ```bash
-# Higher quality (more bandwidth)
-export AVATAR_WIDTH="1920"
-export AVATAR_HEIGHT="1080"
+# Option A: Docker (recommended)
+sudo docker run --rm \
+    -p 7880:7880 \
+    -p 7881:7881 \
+    -p 7882:7882/udp \
+    -e LIVEKIT_KEYS="devkey: devsecret" \
+    livekit/livekit-server:latest
 
-# Lower quality (less bandwidth)
-export AVATAR_WIDTH="640"
-export AVATAR_HEIGHT="360"
+# Option B: Native binary
+livekit-server --dev
 ```
 
-### Change Frame Rate
-
-Edit `livekit_avatar/custom_avatar_worker.py`:
-
-```python
-FPS = 30  # Change from 50 to 30 for lower GPU usage
-```
-
-### Multiple Avatar Images
-
-Create multiple avatar configurations:
+#### Terminal 2: Token Server
 
 ```bash
-# Create avatar config files
-export SOURCE_PATH_1="avatars/avatar1.jpg"
-export SOURCE_PATH_2="avatars/avatar2.jpg"
-
-# Switch between them by changing SOURCE_PATH before starting
+uv run python livekit_client/token_server.py
 ```
+
+#### Terminal 3: Agent Worker
+
+```bash
+# Set environment variables
+export GOOGLE_APPLICATION_CREDENTIALS="/path/to/creds.json"
+export VERTEX_PROJECT_ID="your-project-id"
+export VERTEX_LOCATION="us-central1"
+export DATA_ROOT="checkpoints/ditto_trt_Ampere_Plus"
+export CFG_PKL="checkpoints/ditto_cfg/v0.4_hubert_cfg_trt_online.pkl"
+export SOURCE_PATH="avatars/your_avatar.jpg"
+
+# Start agent (launches avatar worker automatically)
+uv run python livekit_avatar/agent_worker.py dev
+```
+
+---
+
+## Testing the Setup
+
+### 1. Open the Web Client
+
+Navigate to: `http://localhost:8000/simple_client.html`
+
+### 2. Connect to Room
+
+1. Enter your name/ID in the input field
+2. Click "Connect"
+3. Allow microphone access when prompted
+
+### 3. Test Conversation
+
+1. Speak into your microphone
+2. The avatar should respond with synchronized audio and video
+3. Check console for any errors
+
+### Expected Logs
+
+**Agent Worker:**
+```
+INFO:livekit.agents - Starting agent in room: my-avatar-test-room
+INFO:livekit.agents - ✅ Connected to room
+INFO:livekit.agents - Launching avatar worker subprocess...
+INFO:livekit.agents - ✅ Avatar worker launched (PID: 12345)
+INFO:livekit.agents - ✅ Agent session started
+```
+
+**Avatar Worker:**
+```
+INFO:avatar-worker - Avatar worker starting...
+INFO:avatar-worker - Initializing Ditto video generator...
+INFO:avatar-worker - ✅ Ready
+INFO:avatar-worker - ✅ Connected to room: my-avatar-test-room
+INFO:avatar-worker - ✅ Avatar runner started
+```
+
+### Troubleshooting Quick Checks
+
+| Issue | Check |
+|-------|-------|
+| No video | Is avatar worker running? Check GPU memory |
+| No audio | Is microphone allowed? Check browser permissions |
+| High latency | Check GPU utilization, network latency |
+| Crashes | Check CUDA/TensorRT versions, memory |
+
+See [Troubleshooting Guide](./TROUBLESHOOTING.md) for detailed solutions.
+
+---
 
 ## Production Deployment
 
-### Security Checklist
-
-- [ ] Use cloud-hosted LiveKit (not dev server)
-- [ ] Implement proper token expiration (1-4 hours)
-- [ ] Enable TLS for all connections
-- [ ] Use service account with minimal permissions
-- [ ] Rotate API keys regularly
-- [ ] Implement rate limiting on token server
-- [ ] Add authentication to token endpoint
-
-### Monitoring
+### Environment Variables Summary
 
 ```bash
-# View agent logs
-tail -f /path/to/agent.log
+# Required - LiveKit
+LIVEKIT_URL="wss://your-project.livekit.cloud"
+LIVEKIT_API_KEY="your-api-key"
+LIVEKIT_API_SECRET="your-api-secret"
 
-# Monitor GPU usage
-watch -n 1 nvidia-smi
+# Required - Google Cloud
+GOOGLE_APPLICATION_CREDENTIALS="/path/to/service-account.json"
+VERTEX_PROJECT_ID="your-gcp-project-id"
+VERTEX_LOCATION="us-central1"
+GEMINI_MODEL="gemini-live-2.5-flash-preview-native-audio-09-2025"
 
-# Monitor LiveKit server
-docker logs -f livekit-server
+# Required - Ditto
+DATA_ROOT="checkpoints/ditto_trt_Ampere_Plus"
+CFG_PKL="checkpoints/ditto_cfg/v0.4_hubert_cfg_trt_online.pkl"
+SOURCE_PATH="avatars/your_avatar.jpg"
+
+# Optional - Avatar Settings
+AVATAR_WIDTH="1280"
+AVATAR_HEIGHT="720"
+AVATAR_FPS="25"
 ```
 
-### Backup and Recovery
+### Docker Deployment (Example)
 
-```bash
-# Backup configuration
-tar -czf avatar-config-backup.tar.gz \
-    checkpoints/ \
-    avatars/ \
-    livekit_avatar/ \
-    livekit_client/
+```dockerfile
+FROM nvidia/cuda:12.2-cudnn8-runtime-ubuntu22.04
 
-# Backup service account key (keep secure!)
-cp $GOOGLE_APPLICATION_CREDENTIALS ~/backups/avatar-sa-key.json
+# Install Python and dependencies
+RUN apt-get update && apt-get install -y \
+    python3.10 \
+    python3-pip \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy application
+WORKDIR /app
+COPY . .
+
+# Install Python packages
+RUN pip install -r requirements.txt
+
+# Set entrypoint
+CMD ["python", "livekit_avatar/agent_worker.py", "start"]
 ```
+
+### Scaling Considerations
+
+1. **GPU per Avatar Worker**: Each avatar worker needs dedicated GPU
+2. **Agent Workers**: Can be scaled horizontally (CPU-bound)
+3. **Room Routing**: Use LiveKit's room routing for multi-room support
+4. **Health Checks**: Monitor GPU memory, frame rate, latency
+
+---
 
 ## Next Steps
 
-- Review [Architecture Documentation](ARCHITECTURE.md) for system understanding
-- Check [API Reference](API_REFERENCE.md) for customization options
-- Read [Troubleshooting Guide](TROUBLESHOOTING.md) for common issues
-- Test with multiple concurrent users
-- Implement custom conversation flows
-- Add analytics and logging
+- [Architecture Overview](./ARCHITECTURE.md) - Understand system design
+- [API Reference](./API_REFERENCE.md) - Customize components
+- [Troubleshooting](./TROUBLESHOOTING.md) - Solve common issues
+
