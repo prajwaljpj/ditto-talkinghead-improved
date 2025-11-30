@@ -28,8 +28,8 @@ from livekit.agents.voice.avatar import (
 # Add parent directory to path for ditto_video_generator import
 sys.path.insert(0, str(Path(__file__).parent))
 # Using LiveKit-optimized version with simplified architecture
-from ditto_video_generator_decoupled import (
-    DittoVideoGeneratorDecoupled as DittoVideoGenerator,
+from ditto_video_generator import (
+    DittoVideoGenerator,
 )
 
 # Configure logging
@@ -87,26 +87,6 @@ async def main(api_url: str, api_token: str):
     logger.info(f"✅ Connected to room: {room.name}")
 
     should_stop = asyncio.Event()
-
-    # Handle agent state changes via data channel
-    @room.on("data_received")
-    def _on_data_received(data: rtc.DataPacket):
-        try:
-            if data.topic == "agent_state":
-                import json
-
-                state_msg = json.loads(data.data.decode("utf-8"))
-
-                if state_msg.get("type") == "agent_state":
-                    new_state = state_msg.get("state")
-                    old_state = state_msg.get("old_state")
-
-                    logger.info(f"📥 Received agent state: {old_state} → {new_state}")
-
-                    # Update video generator state
-                    # video_gen.set_agent_state(new_state)
-        except Exception as e:
-            logger.error(f"Error handling data packet: {e}", exc_info=True)
 
     # Stop when agent disconnects or room disconnects
     @room.on("participant_disconnected")
