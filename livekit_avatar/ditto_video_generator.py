@@ -94,8 +94,8 @@ class DittoVideoGenerator(VideoGenerator):
 
         # Ditto chunking parameters (from inference.py)
         self.chunksize = (3, 5, 2)  # (past, current, future) frames
-        self.split_len = sum(self.chunksize) * 640  # 6400 samples
-        self.stride = 640  # 40ms @ 16kHz
+        self.split_len = int(sum(self.chunksize) * 0.04 * 16000) + 80  # 6480 samples (matches inference.py)
+        self.stride = self.chunksize[1] * 640  # 3200 samples = 5 frames (prevents overlap)
 
         # Add initial padding (from inference.py line 48)
         padding = np.zeros(self.chunksize[0] * 640, dtype=np.float32)
