@@ -75,10 +75,12 @@ async def main(api_url: str, api_token: str):
     # Create Ditto video generator
     logger.info("Initializing Ditto video generator...")
     video_gen = DittoVideoGenerator(
-        options=avatar_options,
-        data_root=DATA_ROOT,
         cfg_pkl=CFG_PKL,
+        data_root=DATA_ROOT,
         source_path=SOURCE_PATH,
+        video_width=AVATAR_WIDTH,
+        video_height=AVATAR_HEIGHT,
+        video_fps=AVATAR_FPS,
     )
 
     # Connect to the room
@@ -113,6 +115,10 @@ async def main(api_url: str, api_token: str):
     )
 
     try:
+        # Start the video generator's background processor
+        await video_gen.start()
+        logger.info("✅ Video generator background processor started")
+        
         # Start the avatar runner
         await runner.start()
         logger.info("✅ Avatar runner started - ready to receive audio from agent")

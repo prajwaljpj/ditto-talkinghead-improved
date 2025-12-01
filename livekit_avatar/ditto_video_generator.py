@@ -1,376 +1,496 @@
-import sys
+#!/usr/bin/env python3
+"""
+Ditto Video Generator - Simplified Implementation
+Based on AudioWave pattern from LiveKit examples.
+
+Generates lip-synced video from audio using Ditto TalkingHead SDK.
+"""
+
 import os
+import sys
 import asyncio
 import logging
-import numpy as np
-import cv2
-import time
-from typing import Optional, Union
+import threading
 from collections.abc import AsyncGenerator, AsyncIterator
+from typing import Optional
+
+import numpy as np
 from livekit import rtc
-from livekit.agents import utils
-from livekit.agents.voice.avatar import (
-    AudioSegmentEnd,
-    AvatarOptions,
-    VideoGenerator,
-)
+from livekit.agents.voice.avatar import AudioSegmentEnd, VideoGenerator
 
-# Configure logging
-logger = logging.getLogger(__name__)
-
-# Adjust system path
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
+from stream_pipeline_online import StreamSDK
 
-try:
-    from stream_pipeline_online import StreamSDK
-except ImportError:
-    raise ImportError("StreamSDK not found.")
-
-
-def rgb_to_i420(frame_rgb: np.ndarray, width: int, height: int) -> bytes:
-    """Convert RGB to I420."""
-    if frame_rgb.shape[0] != height or frame_rgb.shape[1] != width:
-        frame_rgb = cv2.resize(
-            frame_rgb, (width, height), interpolation=cv2.INTER_LINEAR
-        )
-
-    frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
-    yuv_frame = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2YUV_I420)
-    return yuv_frame.tobytes()
+logger = logging.getLogger(__name__)
 
 
 class DittoVideoGenerator(VideoGenerator):
     """
-    Ditto video generator with LiveKit audio_wave pattern.
+    Simplified video generator following AudioWave pattern.
 
-    Correctly extracts audio from buffer position matching video representation.
+    Key changes from previous implementation:
+    - Single input queue (AudioWave pattern)
+    - Timeout-based idle generation (no state machine!)
+    - Simple video/audio pairing via queues
+    - Clean AudioSegmentEnd handling
     """
 
     def __init__(
         self,
-        options: AvatarOptions,
-        data_root: str,
         cfg_pkl: str,
+        data_root: str,
         source_path: str,
+        *,
+        video_width: int = 1280,
+        video_height: int = 720,
+        video_fps: int = 25,
     ):
-        self._options = options
-        self._audio_queue = asyncio.Queue[Union[rtc.AudioFrame, AudioSegmentEnd]]()
-        self._audio_resampler: Optional[rtc.AudioResampler] = None
-        self._loop = asyncio.get_event_loop()
+        """
+        Initialize Ditto video generator.
 
-        # Ditto configuration
-        self.chunksize = (3, 5, 2)  # (past, current, future)
-        self.split_len = 6480  # Total chunk size
-        self.stride = 3200  # Advance by 5 frames
+        Args:
+            cfg_pkl: Path to Ditto config pickle
+            data_root: Path to Ditto model checkpoints
+            source_path: Path to source image
+            video_width: Output video width
+            video_height: Output video height
+            video_fps: Output video FPS
+        """
+        self._video_width = video_width
+        self._video_height = video_height
+        self._video_fps = video_fps
 
-        # Video frames from Ditto callback
-        self._video_frames: list[rtc.VideoFrame] = []
+        # === AUDIOWAVE PATTERN: Single input queue ===
+        self._audio_input_queue: asyncio.Queue[
+            rtc.AudioFrame | AudioSegmentEnd
+        ] = asyncio.Queue()
 
-        # Tracking
-        self._chunks_processed = 0
-        self._frames_yielded = 0
+        # === DITTO-SPECIFIC: Output queues for pairing ===
+        self._video_queue: asyncio.Queue[rtc.VideoFrame] = asyncio.Queue()
+        self._audio_output_queue: asyncio.Queue[
+            rtc.AudioFrame | AudioSegmentEnd
+        ] = asyncio.Queue()
 
-        # Initialize Ditto
+        # === DITTO-SPECIFIC: Audio buffering ===
+        self._audio_buffer = np.zeros(0, dtype=np.float32)
+        self._buffer_lock = asyncio.Lock()
+
+        # === DITTO-SPECIFIC: Chunk tracking for audio-video pairing ===
+        self._chunk_id = 0
+        self._pending_audio: dict[int, np.ndarray] = {}  # {chunk_id: audio_samples}
+        self._audio_lock = threading.Lock()
+
+        # === Initialize Ditto SDK ===
         logger.info("Initializing Ditto StreamSDK...")
         self.sdk = StreamSDK(cfg_pkl, data_root)
         self.sdk.setup(
             source_path,
             output_path="/dev/null",
-            frame_callback=self._on_video_frame,
+            frame_callback=self._on_video_frame,  # Ditto's async callback
             online_mode=True,
-            fps=options.video_fps,
+            fps=25,
         )
         self.sdk.setup_Nd(N_d=1000000)
 
-        # Warmup
-        logger.info("Warming up Ditto...")
-        silent_chunk = np.zeros(self.split_len, dtype=np.float32)
-        for i in range(2):
-            self.sdk.run_chunk(silent_chunk, self.chunksize)
-        self._video_frames.clear()
-        logger.info("✅ Ditto ready")
+        # Ditto chunking parameters (from inference.py)
+        self.chunksize = (3, 5, 2)  # (past, current, future) frames
+        self.split_len = sum(self.chunksize) * 640  # 6400 samples
+        self.stride = 640  # 40ms @ 16kHz
 
-        # AudioByteStream for frame-aligned chunks
-        self._audio_bstream = utils.audio.AudioByteStream(
-            sample_rate=16000,
-            num_channels=1,
-            samples_per_channel=640,
+        # Add initial padding (from inference.py line 48)
+        padding = np.zeros(self.chunksize[0] * 640, dtype=np.float32)
+        self._audio_buffer = padding.copy()
+
+        # Background task
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._processor_task: Optional[asyncio.Task] = None
+        self._running = False
+
+        logger.info(
+            f"✅ Ditto initialized: {video_width}x{video_height} @ {video_fps}fps"
         )
 
-        # Buffer for accumulating audio samples for Ditto chunks
-        self._sample_buffer = np.zeros((0,), dtype=np.float32)
-
-        # State machine for clean idle ↔ TTS transitions
-        self._is_speaking = False  # False = idle, True = TTS/speaking
-        self._pending_transition = False  # Flag for state change
-
-        # Add global padding (from inference.py line 48)
-        padding = np.zeros(self.chunksize[0] * 640, dtype=np.float32)
-        self._sample_buffer = np.concatenate([padding, self._sample_buffer])
-
-        self._chunks_processed = 0
-        self._frames_yielded = 0
-
-    def _on_video_frame(self, frame_rgb: np.ndarray, frame_idx: int, timestamp: float):
-        """Video frame callback from Ditto."""
-        try:
-            i420_data = rgb_to_i420(
-                frame_rgb, self._options.video_width, self._options.video_height
-            )
-            video_frame = rtc.VideoFrame(
-                data=i420_data,
-                width=self._options.video_width,
-                height=self._options.video_height,
-                type=rtc.VideoBufferType.I420,
-            )
-            self._video_frames.append(video_frame)
-        except Exception as e:
-            logger.error(f"Video callback error: {e}", exc_info=True)
+    # ============================================================================
+    # VideoGenerator Interface (Required by LiveKit)
+    # ============================================================================
 
     async def push_audio(self, frame: rtc.AudioFrame | AudioSegmentEnd) -> None:
-        """Push audio frame from agent."""
+        """
+        Push audio from agent to generator.
+
+        This is called by AvatarRunner when agent sends TTS audio.
+        AudioWave pattern: Just queue it!
+        """
         if isinstance(frame, AudioSegmentEnd):
-            logger.info("📨 Received AudioSegmentEnd from agent")
+            logger.info("📨 push_audio: Received AudioSegmentEnd from agent")
         else:
-            logger.info(
-                f"=================Audio Frame: {frame}=============,"
-                f"📨 Received audio frame: {frame.samples_per_channel} samples, "
-                f"{frame.sample_rate}Hz, {frame.num_channels}ch"
-            )
-        await self._audio_queue.put(frame)
+            logger.info(f"📨 push_audio: Received TTS audio frame: {frame.samples_per_channel} samples @ {frame.sample_rate}Hz")
+        await self._audio_input_queue.put(frame)
 
     def clear_buffer(self) -> None:
         """
-        Called by AvatarRunner on interruption.
+        Clear all buffers on interruption.
 
-        For better conversational experience, we DON'T actually clear buffers.
+        This is called by AvatarRunner when user interrupts.
         """
-        logger.info(
-            "🔄 Interruption detected - allowing avatar to complete current speech"
-        )
-        # For better UX, don't clear - but if we did clear:
-        # self._audio_output_buffer = np.zeros((0,), dtype=np.float32)
+        # Drain all queues
+        while not self._audio_input_queue.empty():
+            try:
+                self._audio_input_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+
+        while not self._video_queue.empty():
+            try:
+                self._video_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+
+        while not self._audio_output_queue.empty():
+            try:
+                self._audio_output_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+
+        # Clear pending audio chunks (thread-safe)
+        with self._audio_lock:
+            self._pending_audio.clear()
+
+        # Reset audio buffer to initial padding
+        # Note: Not using async lock since clear_buffer is sync and typically
+        # called when processing is paused
+        padding = np.zeros(self.chunksize[0] * 640, dtype=np.float32)
+        self._audio_buffer = padding.copy()
+        self._chunk_id = 0
+
+        logger.info("🔄 Buffers cleared")
 
     def __aiter__(
         self,
     ) -> AsyncIterator[rtc.VideoFrame | rtc.AudioFrame | AudioSegmentEnd]:
-        return self._video_generation_impl()
+        """Return async iterator for frame generation."""
+        return self._stream_impl()
 
-    async def _video_generation_impl(
+    # ============================================================================
+    # Background Audio Processing
+    # ============================================================================
+
+    async def start(self):
+        """Start background audio processor."""
+        if self._running:
+            return
+
+        # Get the current running event loop
+        self._loop = asyncio.get_running_loop()
+
+        self._running = True
+        self._processor_task = asyncio.create_task(self._process_audio())
+        logger.info("🚀 Background audio processor started")
+
+    async def _process_audio(self):
+        """
+        Background task: Process incoming audio through Ditto SDK.
+
+        Flow:
+        1. Get audio from input queue (with timeout)
+        2. Buffer audio samples
+        3. When buffer >= chunk size, process through Ditto
+        4. Ditto generates video frames via callback
+        5. Callback pairs video with corresponding audio
+        
+        IMPORTANT: This task ONLY processes TTS audio, NOT idle frames!
+        Idle frame generation is handled separately to avoid race conditions.
+        """
+        while self._running:
+            try:
+                # Wait for TTS audio from agent
+                try:
+                    frame = await asyncio.wait_for(
+                        self._audio_input_queue.get(), timeout=0.1  # 100ms timeout
+                    )
+                except asyncio.TimeoutError:
+                    # No TTS audio - just wait, don't generate idle frames!
+                    # This prevents idle frames from interfering with TTS playback.
+                    await asyncio.sleep(0.001)
+                    continue
+
+                # Handle AudioSegmentEnd
+                if isinstance(frame, AudioSegmentEnd):
+                    logger.info("📨 AudioSegmentEnd received - will flush remaining")
+                    # Signal end (will be picked up by stream generator)
+                    await self._audio_output_queue.put(AudioSegmentEnd())
+                    continue
+
+                # Process AudioFrame (TTS only!)
+                if isinstance(frame, rtc.AudioFrame):
+                    # Resample to 16kHz if needed
+                    audio_samples = self._resample_to_16k(frame)
+                    logger.info(f"🎵 TTS AUDIO: Received {len(audio_samples)} samples, buffer now {len(self._audio_buffer)} samples")
+
+                    async with self._buffer_lock:
+                        self._audio_buffer = np.concatenate(
+                            [self._audio_buffer, audio_samples]
+                        )
+                        logger.info(f"🎵 Buffer after concat: {len(self._audio_buffer)} samples (need {self.split_len} to process)")
+
+                    # Process TTS chunks through Ditto
+                    await self._process_chunks()
+
+            except Exception as e:
+                logger.error(f"Audio processor error: {e}", exc_info=True)
+
+    async def _process_chunks(self):
+        """Process buffered audio chunks through Ditto SDK."""
+        chunks_processed = 0
+        async with self._buffer_lock:
+            while len(self._audio_buffer) >= self.split_len:
+                # Extract chunk with context (past, current, future)
+                chunk = self._audio_buffer[: self.split_len].copy()
+
+                # Audio for video (current portion only)
+                # Chunk: [past: 1920][current: 3200][future: 1280]
+                audio_for_video = chunk[1920:5120]  # 3200 samples = 5 frames worth
+
+                # Store with chunk ID for later pairing
+                chunk_id = self._chunk_id
+                with self._audio_lock:
+                    self._pending_audio[chunk_id] = audio_for_video
+
+                logger.info(f"🎬 CHUNK #{chunk_id}: Sending to Ditto SDK (audio stored: {len(audio_for_video)} samples)")
+                
+                self._chunk_id += 1
+                chunks_processed += 1
+
+                # Advance buffer by stride (not full chunk!)
+                self._audio_buffer = self._audio_buffer[self.stride :]
+
+                # Process through Ditto (blocking call in executor)
+                await self._loop.run_in_executor(
+                    None, self.sdk.run_chunk, chunk, self.chunksize
+                )
+                logger.info(f"✅ CHUNK #{chunk_id}: Ditto SDK run_chunk completed (video frames will arrive via callback)")
+                # Video frames will arrive via _on_video_frame callback
+        
+        if chunks_processed > 0:
+            logger.info(f"📊 Processed {chunks_processed} chunks in this batch")
+    
+    async def _generate_idle_frame(self) -> tuple[rtc.VideoFrame, rtc.AudioFrame]:
+        """
+        Generate a single idle frame (neutral expression with silence).
+        Called by main loop when no TTS audio is available.
+        """
+        # Generate silence (640 samples = 40ms @ 16kHz)
+        silence = np.zeros(640, dtype=np.float32)
+        
+        # Add to buffer and process if needed
+        async with self._buffer_lock:
+            self._audio_buffer = np.concatenate([self._audio_buffer, silence])
+            
+            # Only process if we have enough for a chunk
+            if len(self._audio_buffer) >= self.split_len:
+                chunk = self._audio_buffer[:self.split_len].copy()
+                audio_for_video = chunk[1920:5120]
+                
+                chunk_id = self._chunk_id
+                with self._audio_lock:
+                    self._pending_audio[chunk_id] = audio_for_video
+                
+                self._chunk_id += 1
+                self._audio_buffer = self._audio_buffer[self.stride:]
+                
+                # Process through Ditto
+                await self._loop.run_in_executor(
+                    None, self.sdk.run_chunk, chunk, self.chunksize
+                )
+        
+        # Wait briefly for video frame from callback
+        try:
+            video = await asyncio.wait_for(self._video_queue.get(), timeout=0.1)
+            audio_silence = rtc.AudioFrame(
+                data=(np.zeros(640, dtype=np.int16)).tobytes(),
+                sample_rate=16000,
+                num_channels=1,
+                samples_per_channel=640,
+            )
+            return video, audio_silence
+        except asyncio.TimeoutError:
+            # If no video available, return None (caller will handle)
+            return None, None
+
+    # ============================================================================
+    # Ditto SDK Callback (runs in SDK thread)
+    # ============================================================================
+
+    def _on_video_frame(self, frame_rgb: np.ndarray, frame_idx: int, timestamp: float):
+        """
+        Called by Ditto SDK when video frame is generated.
+
+        Runs in Ditto's worker thread, so must be thread-safe!
+        Pairs video frame with corresponding audio and queues both.
+        """
+        try:
+            logger.info(f"🎥 CALLBACK: Received video frame #{frame_idx} from Ditto SDK")
+            
+            # Convert BGR to RGB and create VideoFrame
+            video_frame = rtc.VideoFrame(
+                width=frame_rgb.shape[1],
+                height=frame_rgb.shape[0],
+                type=rtc.VideoBufferType.RGB24,
+                data=frame_rgb.tobytes(),
+            )
+
+            # Calculate which chunk this frame belongs to
+            chunk_id = frame_idx // 5  # ~5 frames per chunk on average
+
+            # Get corresponding audio
+            with self._audio_lock:
+                if chunk_id in self._pending_audio:
+                    chunk_audio = self._pending_audio[chunk_id]
+
+                    # Extract audio for THIS specific frame
+                    # Each frame = 640 samples (40ms @ 16kHz)
+                    frame_offset_in_chunk = (frame_idx % 5) * 640
+
+                    if frame_offset_in_chunk + 640 <= len(chunk_audio):
+                        audio_samples = chunk_audio[
+                            frame_offset_in_chunk : frame_offset_in_chunk + 640
+                        ]
+                        
+                        logger.info(f"🔊 PAIRING: Frame #{frame_idx} (chunk {chunk_id}) paired with {len(audio_samples)} audio samples")
+
+                        # Create audio frame
+                        audio_int16 = (audio_samples * 32768.0).astype(np.int16)
+                        audio_int16 = np.clip(audio_int16, -32768, 32767)
+                        audio_frame = rtc.AudioFrame(
+                            data=audio_int16.tobytes(),
+                            sample_rate=16000,
+                            num_channels=1,
+                            samples_per_channel=640,
+                        )
+
+                        # Queue both (thread-safe)
+                        asyncio.run_coroutine_threadsafe(
+                            self._video_queue.put(video_frame), self._loop
+                        )
+                        asyncio.run_coroutine_threadsafe(
+                            self._audio_output_queue.put(audio_frame), self._loop
+                        )
+
+                    # Cleanup old chunks to prevent memory leak
+                    if chunk_id > 10:
+                        self._pending_audio.pop(chunk_id - 10, None)
+
+        except Exception as e:
+            logger.error(f"Error in video callback: {e}", exc_info=True)
+
+    # ============================================================================
+    # Main Generator (yields frames to AvatarRunner)
+    # ============================================================================
+
+    async def _stream_impl(
         self,
-    ) -> AsyncGenerator[rtc.VideoFrame | rtc.AudioFrame | AudioSegmentEnd]:
-        """Main generation loop."""
+    ) -> AsyncGenerator[rtc.VideoFrame | rtc.AudioFrame | AudioSegmentEnd, None]:
+        """
+        Main generator following AudioWave pattern.
+
+        Yields video+audio pairs to AvatarRunner.
+        """
+        frame_count = 0
+        idle_mode = True  # Start in idle mode
+
         while True:
             try:
-                # Wait for audio with timeout
-                timeout = 0.5 / self._options.video_fps  # ~20ms for 25fps
-                frame = await asyncio.wait_for(
-                    self._audio_queue.get(),
-                    timeout=timeout,
-                )
-            except asyncio.TimeoutError:
-                # No TTS - generate idle frame
-                async for output in self._process_idle():
-                    yield output
-                continue
-
-            # Handle AudioSegmentEnd separately (doesn't have audio data)
-            if isinstance(frame, AudioSegmentEnd):
-                # Flush AudioByteStream
-                audio_frames = self._audio_bstream.flush()
-            else:
-                # Resample if needed (only for actual audio frames)
-                resampled_frames = self._resample_to_16k(frame)
-
-                # Chunk into frame-aligned pieces
-                audio_frames = []
-                for rf in resampled_frames:
-                    for synced in self._audio_bstream.push(rf.data):
-                        audio_frames.append(synced)
-
-            # Generate video for each audio frame
-            for audio_frame in audio_frames:
-                async for output in self._process_audio_frame(audio_frame):
-                    yield output
-
-            # Yield AudioSegmentEnd and transition back to idle
-            if isinstance(frame, AudioSegmentEnd):
-                # Flush remaining TTS
-                async for output in self._flush():
-                    yield output
-
-                # Transition: Speaking → Idle
-                logger.info("🔇 Transition: Speaking → Idle")
-                self._is_speaking = False
-
-                # Yield AudioSegmentEnd to notify runner
-                yield AudioSegmentEnd()
-
-    async def _process_audio_frame(
-        self, audio_frame: rtc.AudioFrame
-    ) -> AsyncGenerator[rtc.VideoFrame | rtc.AudioFrame]:
-        """Process one frame-aligned audio chunk."""
-
-        # Check if this is real TTS (transition from idle → speaking)
-        # Idle frames are silent, TTS frames have energy
-        audio_int16 = np.frombuffer(audio_frame.data, dtype=np.int16)
-        audio_energy = np.abs(audio_int16).mean()
-        is_tts = audio_energy > 10  # Threshold to detect non-silent audio
-
-        # Transition: idle → TTS (clear contaminated buffers!)
-        if not self._is_speaking and is_tts:
-            logger.info("🎤 Transition: Idle → Speaking (clearing buffers)")
-            self._is_speaking = True
-
-            # Clear sample buffer (remove idle contamination)
-            self._sample_buffer = np.zeros((0,), dtype=np.float32)
-
-            # Clear video frames (remove any pending idle frames)
-            # This prevents idle video from being paired with TTS audio
-            self._video_frames.clear()
-
-            # Add padding for past context (represents "at rest" before speech)
-            # Without this, first TTS chunk has no context about previous mouth position
-            padding = np.zeros(
-                self.chunksize[0] * 640, dtype=np.float32
-            )  # 1920 samples
-            self._sample_buffer = np.concatenate([padding, self._sample_buffer])
-
-            # Reset chunks counter (fresh start)
-            self._chunks_processed = 0
-
-            logger.info("✓ Buffers cleared with padding, ready for TTS")
-
-        # Convert to float32 and add to buffer
-        audio_float32 = audio_int16.astype(np.float32) / 32768.0
-        self._sample_buffer = np.concatenate([self._sample_buffer, audio_float32])
-
-        # Process when buffer has enough samples
-        async for output in self._process_buffer():
-            yield output
-
-    async def _process_idle(
-        self,
-    ) -> AsyncGenerator[rtc.VideoFrame | rtc.AudioFrame]:
-        """
-        Generate idle frame with silent audio for Ditto processing.
-
-        Note: We yield ONLY video during idle, not audio.
-        This allows AvatarRunner to correctly track _audio_playing state
-        (False during idle, True during TTS).
-        """
-        # Add silent samples to buffer for Ditto processing
-        silent = np.zeros(640, dtype=np.float32)
-        self._sample_buffer = np.concatenate([self._sample_buffer, silent])
-
-        # Process if buffer ready - but ONLY yield video frames
-        async for output in self._process_buffer():
-            if isinstance(output, rtc.VideoFrame):
-                yield output  # Yield idle video
-            # Skip audio frames during idle (no silent audio yielded)
-
-    async def _process_buffer(
-        self,
-    ) -> AsyncGenerator[rtc.VideoFrame | rtc.AudioFrame]:
-        """Process buffer when ready (>= 6480 samples)."""
-        while len(self._sample_buffer) >= self.split_len:
-            # Extract chunk
-            chunk = self._sample_buffer[: self.split_len].copy()
-            logger.info(
-                f"===========Chunk being processed: {chunk}================\n===============Chunk Shape: {chunk.shape}===================="
-            )
-            # Determine which audio samples will be output
-            # CRITICAL: Ditto handles lookahead INTERNALLY in its model
-            # We should NOT add lookahead offset when extracting audio
-            # Just skip padding on first chunk, extract stride portion for output
-
-            if self._chunks_processed == 0:
-                # First chunk: skip padding only (1920 samples)
-                # Video frames 0-4 represent TTS audio samples 0-3199
-                audio_start = self.chunksize[0] * 640  # 1920 (padding)
-                audio_end = audio_start + self.stride  # 1920 + 3200 = 5120
-                audio_for_frames = chunk[audio_start:audio_end].copy()
-                logger.debug(
-                    f"Chunk 0: Extracting audio[{audio_start}:{audio_end}] (skipping padding)"
-                )
-            else:
-                # Subsequent chunks: extract first stride samples
-                # These represent the "new" audio advanced by stride
-                audio_start = 0
-                audio_end = self.stride  # 3200
-                audio_for_frames = chunk[audio_start:audio_end].copy()
-                logger.debug(
-                    f"Chunk {self._chunks_processed}: Extracting audio[{audio_start}:{audio_end}]"
-                )
-
-            # Process through Ditto
-            await self._loop.run_in_executor(
-                None, self.sdk.run_chunk, chunk, self.chunksize
-            )
-            self._chunks_processed += 1
-
-            # Advance by stride (5 frames = 3200 samples)
-            self._sample_buffer = self._sample_buffer[self.stride :]
-
-            # Ditto outputs 5 video frames
-            # Create 5 audio frames from the processed samples
-            num_video = len(self._video_frames)
-
-            for i in range(min(num_video, 5)):
-                video = self._video_frames.pop(0)
-
-                # Extract 640 samples for this frame
-                start = i * 640
-                end = start + 640
-                audio_samples = audio_for_frames[start:end]
-
-                # Create audio frame from samples
-                audio_int16 = (audio_samples * 32768.0).astype(np.int16)
-                audio_int16 = np.clip(audio_int16, -32768, 32767)
-                audio_frame = rtc.AudioFrame(
-                    data=audio_int16.tobytes(),
-                    sample_rate=16000,
-                    num_channels=1,
-                    samples_per_channel=640,
-                )
-
-                # Yield video and audio immediately (no delay)
-                yield video
-                yield audio_frame
-                self._frames_yielded += 1
-
-                if self._frames_yielded % 25 == 0:
-                    logger.info(
-                        f"Frames: {self._frames_yielded}, Chunks: {self._chunks_processed}"
+                # Wait for TTS audio with timeout
+                try:
+                    audio = await asyncio.wait_for(
+                        self._audio_output_queue.get(), timeout=0.05  # 50ms timeout
                     )
+                    idle_mode = False  # Got TTS audio
+                except asyncio.TimeoutError:
+                    # No TTS audio - check if we should generate idle frame
+                    if not idle_mode:
+                        # First timeout after TTS - switch to idle mode
+                        idle_mode = True
+                        logger.info("💤 Entering IDLE mode (no TTS audio)")
+                    
+                    # Generate idle frame
+                    video, audio = await self._generate_idle_frame()
+                    if video and audio:
+                        yield video
+                        yield audio
+                        frame_count += 1
+                    else:
+                        # No idle frame ready, just wait
+                        await asyncio.sleep(0.001)
+                    continue
 
-    async def _flush(self) -> AsyncGenerator[rtc.VideoFrame | rtc.AudioFrame]:
-        """Flush remaining buffer."""
-        if len(self._sample_buffer) > 0:
-            # Pad to complete chunk
-            if len(self._sample_buffer) < self.split_len:
-                padding = self.split_len - len(self._sample_buffer)
-                self._sample_buffer = np.concatenate(
-                    [self._sample_buffer, np.zeros(padding, dtype=np.float32)]
-                )
+                # Handle AudioSegmentEnd
+                if isinstance(audio, AudioSegmentEnd):
+                    logger.info("📤 Yielding AudioSegmentEnd")
+                    yield AudioSegmentEnd()
+                    idle_mode = True  # Return to idle after segment ends
+                    continue
 
-            async for output in self._process_buffer():
-                yield output
+                # Got TTS audio - get corresponding video frame
+                if not idle_mode:
+                    logger.info("🎤 Entering TTS mode (got audio)")  
+                    idle_mode = False
+                
+                try:
+                    video = await asyncio.wait_for(self._video_queue.get(), timeout=0.1)
+                except asyncio.TimeoutError:
+                    logger.warning("⚠️ Video not ready for audio - skipping")
+                    continue
 
-    def _resample_to_16k(self, frame: rtc.AudioFrame) -> list[rtc.AudioFrame]:
-        """Resample to 16kHz mono."""
-        if frame.sample_rate != 16000 or frame.num_channels != 1:
-            if self._audio_resampler is None:
-                self._audio_resampler = rtc.AudioResampler(
-                    input_rate=frame.sample_rate,
-                    output_rate=16000,
-                    num_channels=1,
-                )
-            return list(self._audio_resampler.push(frame))
-        return [frame]
+                # Yield synchronized TTS pair
+                yield video
+                yield audio
 
-    async def aclose(self) -> None:
-        """Cleanup method for compatibility with AvatarRunner."""
-        logger.info("Closing DittoVideoGenerator...")
-        # Add any cleanup logic here if needed (close files, release resources, etc.)
-        pass
+                frame_count += 1
+                if frame_count % 25 == 0:
+                    logger.info(f"📊 Yielded {frame_count} frame pairs")
+
+            except Exception as e:
+                logger.error(f"Error in stream generator: {e}", exc_info=True)
+
+    # ============================================================================
+    # Audio Resampling Helper
+    # ============================================================================
+
+    def _resample_to_16k(self, frame: rtc.AudioFrame) -> np.ndarray:
+        """
+        Resample audio frame to 16kHz mono if needed.
+
+        Returns:
+            Float32 array in range [-1, 1]
+        """
+        # Convert to float32
+        audio_data = (
+            np.frombuffer(frame.data, dtype=np.int16).astype(np.float32) / 32768.0
+        )
+
+        # Handle multi-channel (convert to mono)
+        if frame.num_channels > 1:
+            audio_data = audio_data.reshape(-1, frame.num_channels).mean(axis=1)
+
+        # Resample if needed
+        if frame.sample_rate != 16000:
+            import resampy
+
+            audio_data = resampy.resample(
+                audio_data, frame.sample_rate, 16000, filter="kaiser_best"
+            )
+
+        return audio_data
+
+    async def aclose(self):
+        """Cleanup resources."""
+        self._running = False
+        if self._processor_task:
+            self._processor_task.cancel()
+            try:
+                await self._processor_task
+            except asyncio.CancelledError:
+                pass
+
+        logger.info("✅ DittoVideoGenerator closed")
